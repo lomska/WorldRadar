@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import functools
 import html
 import math
 import traceback
@@ -85,7 +86,7 @@ FLAG_ROW_SHARE = 0.65
 _FLAG_SCALE = FLAG_ROW_SHARE * _GRID_ROW_PX / (_GRID_ROW_PX - 2 * _GRID_CELL_PAD_PX)
 
 
-@st.cache_data(show_spinner=False)
+@functools.lru_cache(maxsize=None)  # static local files: no st.cache_data hashing or copies needed
 def flag_image(iso2: str | None, scale: float = _FLAG_SCALE) -> str | None:
     """flag_file's round flag as an embeddable data: URI, shrunk to `scale` of the image with
     transparent padding (default: table-row size; 1.0 = no padding). None if unavailable."""
@@ -113,11 +114,6 @@ def region_pill_column(label: str = "Region"):
         options=[REGION_SHORT_LABEL.get(r, r) for r in du.REGION_COLOR_MAP],
         color=list(du.REGION_COLOR_MAP.values()),
     )
-
-
-def with_short_regions(df: pd.DataFrame, col: str = "region") -> pd.DataFrame:
-    """Copy of df with its region column shown as short region names (for tables/bar labels)."""
-    return df.assign(**{col: df[col].map(lambda r: REGION_SHORT_LABEL.get(r, r))})
 
 
 # Streamlit's own font, so charts match the rest of the page. Text sizes: axis labels 12px, sources 11px;
@@ -240,17 +236,10 @@ def add_split_line(
     ))
 
 
-def shared_legend(names, color_map: dict, forecast_key: bool = False, margin_top: str = "0", bar: bool = False,
-                  indent: int = 0):
-    """
-    One HTML legend (colored swatch + name per series) for a chart that hides its own
-    legend: line swatches, or bar swatches with bar=True (trend_stacked_bar).
-    forecast_key=True appends grey "Observed" / "Forecast" keys, each with a line swatch
-    (solid / dotted, as add_split_line draws them) and a bar swatch (full / half strength,
-    as trend_stacked_bar draws them). A negative margin_top (e.g. "-1rem") pulls the
-    legend up into Streamlit's gap between elements, closer to the chart above. indent is a
-    left padding in px.
-    """
+def forecast_legend():
+    """The Observed / Forecast key at the top of the Trends tab: a line swatch (solid / dotted, as
+    add_split_line draws them) and a bar swatch (full / FORECAST_BAR_ALPHA strength, as
+    trend_stacked_bar draws them) for each."""
     def line_swatch(color, style="solid"):
         return f'<span style="display:inline-block;width:18px;height:0;border-top:3px {style} {color}"></span>'
 
@@ -265,22 +254,11 @@ def shared_legend(names, color_map: dict, forecast_key: bool = False, margin_top
             f'{"".join(swatches)}{label}</span>'
         )
 
-    def swatch(color):
-        return bar_swatch(color, 1.0) if bar else line_swatch(color)
-
-    items = "".join(item(REGION_SHORT_LABEL.get(n, n), swatch(color_map.get(n, du.LIGHT_GREY))) for n in names)
-    if forecast_key:
-        grey = du.TROLLEY_GREY
-        items += (
-            (f'<span style="margin:0 12px 4px 0;color:{du.LIGHT_GREY}">|</span>' if items else "")
-            + item("Observed", line_swatch(grey), bar_swatch(grey, 1.0))
-            + item("Forecast", line_swatch(grey, "dotted"), bar_swatch(grey, FORECAST_BAR_ALPHA))
-        )
-    # min-height: an empty legend (single-series chart) takes one legend row's height, so
-    # the source footers below the charts in a row line up.
+    grey = du.TROLLEY_GREY
+    items = (item("Observed", line_swatch(grey), bar_swatch(grey, 1.0))
+             + item("Forecast", line_swatch(grey, "dotted"), bar_swatch(grey, FORECAST_BAR_ALPHA)))
     st.markdown(
-        f'<div style="display:flex;flex-wrap:wrap;min-height:20px;margin-top:{margin_top};padding-left:{indent}px;'
-        f'font-size:14px;color:black">{items}</div>',
+        f'<div style="display:flex;flex-wrap:wrap;min-height:20px;font-size:14px;color:black">{items}</div>',
         unsafe_allow_html=True,
     )
 
@@ -403,8 +381,7 @@ def stale_sources_notice():
         return
     if not stale:
         return
-    MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-    saved = "; ".join(f"{source_name(key)} (saved {when.day} {MONTHS[when.month - 1]} {when.year})"
+    saved = "; ".join(f"{source_name(key)} (saved {when.day} {MONTH_ABBR[when.month - 1]} {when.year})"
                       for key, (when, _) in sorted(stale.items(), key=lambda kv: source_name(kv[0])))
     st.info(f"Couldn't reach some data sources just now, so their charts show the copy saved earlier: {saved}. "
             "Use **Refresh data** in the sidebar to try again.")
@@ -513,20 +490,19 @@ def trend_chart(
     lines = {label: s for label, s in lines.items() if not s.empty}
     if not lines:
         return None
-    split = forecast_x
+    values = pd.concat(lines.values())
     fig = go.Figure()
     if hline_zero:
         fig.add_hline(y=0, line_width=1, line_color=du.ZERO_LINE_COLOR)
     for label, s in lines.items():
         add_split_line(
-            fig, s, split, name=label, legendgroup=label,
+            fig, s, forecast_x, name=label, legendgroup=label,
             line=dict(color=colors.get(label, TREND_SINGLE_COLOR), width=2),
             hovertemplate=f"{label}: <b>%{{y:{y_format}}}{y_suffix}</b><extra></extra>",
         )
     fig = style_fig(fig, title=title, y_title="", legend=len(lines) > 1, legend_px=TREND_LEGEND_PX,
                     height=TREND_CHART_HEIGHT)
     if y_log:
-        values = pd.concat(lines.values())
         for trace in fig.data:
             real = np.asarray(trace.y, dtype=float)
             trace.customdata = real
@@ -543,20 +519,18 @@ def trend_chart(
         value, label = ref_line
         fig.add_hline(y=value, line_width=1, line_dash="dash", line_color=REF_LINE_COLOR,
                       annotation_text=label, annotation_position="top left",
-                      annotation_font=dict(family=FONT, size=11, color=REF_LINE_COLOR))
+                      annotation_font=REF_FONT)
         ref_values.append(value)
     if ref_band is not None:
         low, high, label = ref_band
         fig.add_hrect(y0=low, y1=high, layer="below", line_width=0, fillcolor=du.REF_BAND_COLOR,
                       opacity=du.REF_BAND_OPACITY,
                       annotation_text=label, annotation_position="top left",
-                      annotation_font=dict(family=FONT, size=11, color=REF_LINE_COLOR))
+                      annotation_font=REF_FONT)
         ref_values += [low, high]
     if ref_values and y_mid is None and y_extent is None:  # extend the axis to the line or band
-        values = pd.concat(lines.values())
         y_extent = (min(float(values.min()), *ref_values), max(float(values.max()), *ref_values))
     if y_mid is not None:
-        values = pd.concat(lines.values())
         lo, hi = y_extent or (float(values.min()), float(values.max()))
         fig.update_yaxes(**symmetric_axis(lo, hi, y_mid))
         fig.add_hline(y=y_mid, line_width=1, line_color=du.ZERO_LINE_COLOR)  # styled like the zero lines
@@ -594,8 +568,7 @@ def trend_stacked_bar(
     wide = pd.DataFrame(lines).dropna(how="any")
     if wide.empty:
         return None
-    split = forecast_x
-    opacity = [FORECAST_BAR_ALPHA if year >= split else 1.0 for year in wide.index]
+    opacity = [FORECAST_BAR_ALPHA if year >= forecast_x else 1.0 for year in wide.index]
     fig = go.Figure()
     for label in wide.columns:
         color = colors.get(label, TREND_SINGLE_COLOR)
@@ -649,6 +622,7 @@ def trends_entity_options(data: pd.DataFrame, countries: pd.DataFrame) -> dict[s
 
 
 REF_LINE_COLOR = "#696969"  # reference lines (replacement fertility, US price level): dashed, gray
+REF_FONT = dict(family=FONT, size=11, color=REF_LINE_COLOR)  # reference-mark labels, both tabs
 HIST_REF_LINE_COLOR = du.BLACK  # the same reference lines on the Distributions histograms: dotted, black
 # Reference marks drawn on both tabs: (value(s), label) -- trend_chart's ref_line / ref_band and the
 # Distributions spec's vlines / band.
@@ -685,15 +659,6 @@ def global_extent(data: pd.DataFrame, codes: list[str]) -> tuple[float, float] |
     the same for whichever country is selected (index_extent's counterpart across countries)."""
     ranges = du.series_ranges(data).reindex(codes).dropna()
     return (float(ranges["min"].min()), float(ranges["max"].max())) if len(ranges) else None
-
-
-def trend_spec(chart_fn, lines: dict[str, pd.Series], colors: dict[str, str], title: str, unit: str, *,
-               sources: list[tuple[str, str]], note: str | None = None, **kw) -> dict:
-    """One Trends chart: chart_fn(lines, colors, title=..., **kw), with its data sources as
-    [(footer label, source key)] (the key looks up its release date, du.source_updates) and an
-    optional note, for the footer."""
-    return dict(chart_fn=chart_fn, lines=lines, colors=colors, title=title, unit=unit, sources=sources, note=note,
-                kw=kw)
 
 
 def place_title_and_legend(fig: go.Figure, height: int, margin_top: int, title_px: int, top_px: int = 14):
@@ -772,9 +737,11 @@ def failed_sources_warning(errors: dict[str, str], sources: list[str]):
 
 def series_spec(chart_fn, series: dict[str, str], t: pd.DataFrame, data: pd.DataFrame, colors: dict[str, str],
                 title: str, unit: str, *, note: str | None = None, **kw) -> dict:
-    """trend_spec for {line label: series code} (columns of t, du.trends_data): the forecast split
-    (du.series_split: projections dotted, a series without them solid throughout) comes from the first
-    code. The footer names each source once, in the order of the lines, with its release date (the
+    """One Trends chart: chart_fn(lines, colors, title=..., **kw), lines {line label: series code}
+    (columns of t, du.trends_data). The spec carries the chart's data sources as [(footer label,
+    source key)] (the key looks up its release date, du.source_updates) and its note, for the
+    footer. The forecast split (du.series_split: projections dotted, a series without them solid
+    throughout) comes from the first code. The footer names each source once, in the order of the lines, with its release date (the
     Observed/Forecast legend at the top of the tab explains the dotted lines, so the footer doesn't).
     The note joins every code's ds.ESTIMATE_NOTES entry, once each (a note contained in another one
     is dropped)."""
@@ -784,8 +751,9 @@ def series_spec(chart_fn, series: dict[str, str], t: pd.DataFrame, data: pd.Data
     sources = [(du.SOURCE_LABELS[key], key) for key in keys]
     notes = list(dict.fromkeys(ds.ESTIMATE_NOTES[c] for c in series.values() if c in ds.ESTIMATE_NOTES))
     notes = [n for n in notes if not any(n != m and n in m for m in notes)] + ([note] if note else [])
-    return trend_spec(chart_fn, {label: t[code] for label, code in series.items()}, colors, title, unit,
-                      sources=sources, note=" ".join(notes) or None, forecast_x=split, **kw)
+    return dict(chart_fn=chart_fn, lines={label: t[code] for label, code in series.items()}, colors=colors,
+                title=title, unit=unit, sources=sources, note=" ".join(notes) or None,
+                kw=dict(kw, forecast_x=split))
 
 
 def demographics_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
@@ -832,6 +800,10 @@ def demographics_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
     ]
 
 
+# trend_chart settings for a percent line from a zero baseline
+PCT_LINE = dict(y_suffix="%", y_format=",.1f", hline_zero=True)
+
+
 def scaled_count(t: pd.DataFrame, code: str, noun: str) -> tuple[pd.DataFrame, str, str]:
     """t with column `code` divided to a readable scale (1.8 trillions, not 1.8e12), plus the
     chart's unit ("trillions of <noun>", or just noun unscaled) and its number format."""
@@ -855,7 +827,7 @@ def economics_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
     investment and finance; then size and structure (GDP is a size measure, not a headline trend)."""
     c = du.CATEGORICAL_COLORS
     t, gdp_unit, gdp_format = scaled_count(t, "WB:NY.GDP.MKTP.PP.KD", "constant 2021 international $")
-    pct = dict(y_suffix="%", y_format=",.1f", hline_zero=True)
+    pct = PCT_LINE
     # Output and employment by sector on one shared y-axis range, so the two charts read side by side
     sector_codes = ["WB:NV.AGR.TOTL.ZS", "WB:NV.IND.TOTL.ZS", "WB:NV.SRV.TOTL.ZS",
                     "WB:SL.AGR.EMPL.ZS", "WB:SL.IND.EMPL.ZS", "WB:SL.SRV.EMPL.ZS"]
@@ -888,8 +860,7 @@ def economics_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
             series_spec(trend_chart, {"Current account": "IMF:BCA_NGDPD"}, t, data, {},
                         "Current account balance", "% of GDP", y_suffix="%", y_format=",.1f", y_mid=0),
             series_spec(trend_chart, {"FDI inflows": "WB:BX.KLT.DINV.WD.GD.ZS"}, t, data, {},
-                        "Foreign direct investment, net inflows", "% of GDP", y_suffix="%", y_format=",.1f",
-                        hline_zero=True),
+                        "Foreign direct investment, net inflows", "% of GDP", **pct),
             series_spec(trend_chart, {"Private credit": "WB:FS.AST.PRVT.GD.ZS"}, t, data, {},
                         "Domestic credit to private sector", "% of GDP", **pct),
         ],
@@ -923,7 +894,7 @@ def labour_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
     whichever country is selected, without a 0-100 scale's empty top."""
     def pct(code):
         top = (global_extent(data, [code]) or (0, 100))[1]
-        return dict(y_suffix="%", y_format=",.1f", hline_zero=True, y_extent=(0, top))
+        return dict(PCT_LINE, y_extent=(0, top))
     return [
         series_spec(trend_chart, {"Participation": "WB:SL.TLF.CACT.ZS"}, t, data, {},
                     "Labour force participation rate", "% of population aged 15+", **pct("WB:SL.TLF.CACT.ZS")),
@@ -938,7 +909,7 @@ def industry_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
     """How much a country makes, how advanced it is, how much of what it sells abroad is
     manufactured, its overall productive know-how, and investment in new technology (SDG 9.2.1,
     9.b.1 and 9.5.1)."""
-    pct = dict(y_suffix="%", y_format=",.1f", hline_zero=True)
+    pct = PCT_LINE
     # ECI is standardised every year (world mean 0, roughly -2.5 to +2.5):
     # one fixed scale for every country, widened only for outliers.
     eci = t["ECI:ECI"].dropna()
@@ -977,10 +948,10 @@ def climate_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
                     "Energy intensity", "megajoules per constant 2021 PPP $ of GDP (lower = more efficient)",
                     y_format=",.2f", hline_zero=True),
         series_spec(trend_chart, {"Renewable share": "WB:EG.FEC.RNEW.ZS"}, t, data, {},
-                    "Renewable energy share", "% of final energy consumption", y_suffix="%", y_format=",.1f",
-                    hline_zero=True, y_extent=(0, 100)),
+                    "Renewable energy share", "% of final energy consumption",
+                    **PCT_LINE, y_extent=(0, 100)),
         series_spec(trend_chart, {"Forest area": "WB:AG.LND.FRST.ZS"}, t, data, {},
-                    "Forest area", "% of land area", y_suffix="%", y_format=",.1f", hline_zero=True),
+                    "Forest area", "% of land area", **PCT_LINE),
         series_spec(trend_chart, {"ND-GAIN index": "NDGAIN:GAIN"}, t, data, {},
                     "ND-GAIN country index", "0–100 (higher = better prepared to climate change)",
                     y_format=",.1f", y_extent=global_extent(data, ["NDGAIN:GAIN"])),
@@ -1003,7 +974,7 @@ def infrastructure_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
     household surveys, see ds.ESTIMATE_NOTES). Fixed 0-100% axes: the
     question is how close a country is to universal access, which a data-fitted axis would hide."""
     c = du.CATEGORICAL_COLORS
-    pct = dict(y_suffix="%", y_format=",.1f", hline_zero=True, y_extent=(0, 100))
+    pct = dict(PCT_LINE, y_extent=(0, 100))
     return [
         series_spec(trend_chart, {"Drinking water": "WB:SH.H2O.BASW.ZS", "Sanitation": "WB:SH.STA.BASS.ZS",
                                  "Hygiene": "WB:SH.STA.HYGN.ZS"}, t, data,
@@ -1041,8 +1012,8 @@ def living_standards_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
         series_spec(trend_chart, {"Gini index": "SWIID:GINI_DISP"}, t, data, {},
                     "Income inequality", "Gini index of disposable income, 0–100", y_format=",.1f", hline_zero=True),
         series_spec(trend_chart, {"Poverty rate": "PIP:POV_3_00"}, t, data, {},
-                    "Poverty at $3.00 a day", "% of population (2021 PPP)", y_suffix="%", y_format=",.1f",
-                    hline_zero=True, ref_line=POVERTY_LINE, note=POVERTY_TARGET_NOTE),
+                    "Poverty at $3.00 a day", "% of population (2021 PPP)", **PCT_LINE,
+                    ref_line=POVERTY_LINE, note=POVERTY_TARGET_NOTE),
         series_spec(trend_chart, {"Life evaluation": "WHR:LADDER"}, t, data, {},
                     "Happiness: life evaluation", "Cantril ladder, 0–10 (3-year average)",
                     y_format=",.2f", hline_zero=True),
@@ -1054,7 +1025,7 @@ def education_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
     education, changes slowly) and expected years (a child entering school now, if current
     enrollment rates persist) share a chart: the gap shows how fast education levels are rising."""
     c = du.CATEGORICAL_COLORS
-    pct = dict(y_suffix="%", y_format=",.1f", hline_zero=True)
+    pct = PCT_LINE
     return [
         series_spec(trend_chart, {"Education spending": "WB:SE.XPD.TOTL.GD.ZS"}, t, data, {},
                     "Government expenditure on education", "% of GDP", ref_band=EDUCATION_BAND, **pct),
@@ -1069,7 +1040,7 @@ def education_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
 def healthcare_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
     """How much a country spends on health, and who pays. Both WDI,
     from the WHO Global Health Expenditure Database (about a 2-year lag)."""
-    pct = dict(y_suffix="%", y_format=",.1f", hline_zero=True)
+    pct = PCT_LINE
     return [
         series_spec(trend_chart, {"Health spending": "WB:SH.XPD.CHEX.GD.ZS"}, t, data, {},
                     "Current health expenditure", "% of GDP", **pct),
@@ -1078,11 +1049,8 @@ def healthcare_charts(t: pd.DataFrame, data: pd.DataFrame) -> list[dict]:
     ]
 
 
-ECONOMICS_SOURCES = ["WDI", "IMF"]
-LABOUR_SOURCES = ["WDI", "ILO"]
 # A line under a Trends section's header.
 SECTION_CAPTIONS = {"Labour market": "Read with the unemployment rate in Economics."}
-CLIMATE_SOURCES = ["WDI", "NDGAIN"]
 
 
 @st.fragment  # a widget in this tab reruns only this tab, not the other one
@@ -1095,23 +1063,25 @@ def tab_trends(data: pd.DataFrame, countries: pd.DataFrame, errors: dict[str, st
     t = du.trends_data(data, entity)
     updates = load_source_updates()
     entity_header(options[entity], countries, entity)
-    shared_legend([], {}, forecast_key=True)
+    forecast_legend()
 
     # A section with no data for this entity is skipped. If that's because its source failed to
     # load, the warning goes here at the top instead, so a failure never goes unnoticed.
     top_warnings, skipped_sources = st.container(), []
-    sections = [  # (header, charts, sources behind them)
-        ("Economics", economics_charts(t, data), ECONOMICS_SOURCES),
-        ("Labour market", labour_charts(t, data), LABOUR_SOURCES),
-        ("Industry & innovation", industry_charts(t, data), ["WDI", "ECI"]),
-        ("Living standards", living_standards_charts(t, data), ["WDI", "SWIID", "PIP", "WHR"]),
-        ("Demographics", demographics_charts(t, data), [du.POPULATION_SOURCE]),
-        ("Climate", climate_charts(t, data), CLIMATE_SOURCES),
-        ("Infrastructure & basic services", infrastructure_charts(t, data), ["WDI"]),
-        ("Education", education_charts(t, data), ["WDI", "UNDP"]),
-        ("Healthcare", healthcare_charts(t, data), ["WDI"]),
+    sections = [
+        ("Economics", economics_charts(t, data)),
+        ("Labour market", labour_charts(t, data)),
+        ("Industry & innovation", industry_charts(t, data)),
+        ("Living standards", living_standards_charts(t, data)),
+        ("Demographics", demographics_charts(t, data)),
+        ("Climate", climate_charts(t, data)),
+        ("Infrastructure & basic services", infrastructure_charts(t, data)),
+        ("Education", education_charts(t, data)),
+        ("Healthcare", healthcare_charts(t, data)),
     ]
-    for header, charts, sources in sections:
+    for header, charts in sections:
+        # The sources behind the section: its charts' sources, each once
+        sources = list(dict.fromkeys(key for spec in charts for _, key in spec["sources"]))
         if not render_trend_section(header, charts, options[entity], errors, sources,
                                     caption=SECTION_CAPTIONS.get(header), updates=updates):
             skipped_sources += [s for s in sources if s not in skipped_sources]
@@ -1144,7 +1114,10 @@ def _edge_labels(edges: list[float], fmt) -> list[str]:
     return labels
 
 
-_POP_EDGES = [0, 1e5, 3e5, 1e6, 3e6, 1e7, 3e7, 1e8, 3e8, 1e9, np.inf]
+def _log_edges(edges: list[float]) -> tuple:
+    """Fixed bins for values spanning orders of magnitude (edges from 0): the first reads '< x'."""
+    return ("edges", edges, [f"< {_short_count(edges[1])}"] + _edge_labels(edges, _short_count)[1:])
+
 
 # label -> settings. bins: ("width", w) = equal-width bins of w (("width", w, "clip_tails") also
 # folds the outer 1% at each end into open-ended edge bins); ("edges", edges, labels) = fixed,
@@ -1163,7 +1136,7 @@ DEMOGRAPHIC_DISTRIBUTIONS: dict[str, dict] = {
         series="POP:SP.POP.TOTL", unit="people", fmt=",.0f", map_scale="log",
         bins_note="Bins widen with the values (roughly ×3 each step), since countries differ by orders "
                   "of magnitude on this indicator.",
-        bins=("edges", _POP_EDGES, ["< 100k"] + _edge_labels(_POP_EDGES, _short_count)[1:])),
+        bins=_log_edges([0, 1e5, 3e5, 1e6, 3e6, 1e7, 3e7, 1e8, 3e8, 1e9, np.inf])),
     "Annual population growth rate": dict(
         series="POP:SP.POP.GROW", unit="percent", fmt=",.2f", suffix="%", bins=("width", 0.5, "clip_tails"), zero_mid=True),
     "Birth rate": dict(series="POP:SP.DYN.CBRT.IN", unit="births per 1,000 population", fmt=",.1f", bins=("width", 2)),
@@ -1196,11 +1169,6 @@ DEMOGRAPHIC_DISTRIBUTIONS: dict[str, dict] = {
         series=du.NET_MIGRATION_RATE, unit="people per 1,000 population", fmt=",.1f",
         map_scale="signed_log", bins=("width", 2, "clip_tails")),  # small states reach +-50 and beyond
 }
-
-
-def _log_edges(edges: list[float]) -> tuple:
-    """Fixed bins for values spanning orders of magnitude (edges from 0): the first reads '< x'."""
-    return ("edges", edges, [f"< {_short_count(edges[1])}"] + _edge_labels(edges, _short_count)[1:])
 
 
 PERCENT = "percent"
@@ -1503,7 +1471,7 @@ def _edge_ticks(left: float, right: float, width: float, max_ticks: int = 12) ->
     return [float(np.round(v, 6)) for v in np.arange(first, right + step * 1e-6, step)]
 
 
-def distribution_bars(dist: pd.DataFrame, bins: tuple, label: str, year_a: int, year_b: int, *, x_title: str,
+def distribution_bars(dist: pd.DataFrame, bins: tuple, year_a: int, year_b: int, *, x_title: str,
                       x_suffix: str = "", vlines: list | None = None, band: tuple | None = None) -> go.Figure:
     """
     Two overlaid bar sets; the tooltip is headed by the bin as an interval (e.g. "[2.1, 2.2)",
@@ -1543,15 +1511,14 @@ def distribution_bars(dist: pd.DataFrame, bins: tuple, label: str, year_a: int, 
             hovertemplate=f"{year}: <b>%{{y}}</b> countries<extra></extra>",
         ))
     fig.update_layout(barmode="overlay", bargap=0.05 if numeric else 1 / 3)
-    ref_font = dict(family=FONT, size=11, color=REF_LINE_COLOR)
     if band is not None:
         low, high, band_label = band
         fig.add_vrect(x0=pos(low), x1=pos(high), layer="below", line_width=0, fillcolor=du.REF_BAND_COLOR,
                       opacity=du.REF_BAND_OPACITY,
-                      annotation_text=band_label, annotation_position="top left", annotation_font=ref_font)
+                      annotation_text=band_label, annotation_position="top left", annotation_font=REF_FONT)
     for xv, line_label in (vlines or []):
         fig.add_vline(x=pos(xv), line_width=1, line_dash="dot", line_color=HIST_REF_LINE_COLOR,
-                      annotation_text=line_label, annotation_position="top right", annotation_font=ref_font)
+                      annotation_text=line_label, annotation_position="top right", annotation_font=REF_FONT)
     zero_x = zero_line_x(dist, bins)
     if zero_x is not None:
         fig.add_vline(x=pos(zero_x), line_width=1, line_color=du.ZERO_LINE_COLOR)
@@ -1634,7 +1601,7 @@ def _log_ticks(lo: float, hi: float) -> list[float]:
     return [10.0 ** k for k in range(math.floor(math.log10(lo)), math.ceil(math.log10(hi)) + 1)]
 
 
-def distribution_boxes(stats: pd.DataFrame, outliers: pd.DataFrame, label: str, unit: str, *, split: float,
+def distribution_boxes(stats: pd.DataFrame, outliers: pd.DataFrame, *, split: float,
                        log: bool, fmt: str, suffix: str = "", fit: bool = False, show_mean: bool = True
                        ) -> go.Figure:
     """
@@ -1737,6 +1704,9 @@ BLUE_SCALE, DIVERGING_SCALE = _even_scale(du.SEQUENTIAL_RAMP), _even_scale(du.DI
 MAP_HEIGHT, MAP_MARGIN_TOP = 430, 10  # the title is above the figure (html_title)
 
 
+MAP_COLORBAR = dict(thickness=12, len=0.7, tickfont=AXIS_TEXT, outlinewidth=0)  # both maps
+
+
 def indicator_choropleth(values: pd.Series, names: pd.Series, spec: dict, *,
                          z_range: tuple[float, float]) -> go.Figure:
     """
@@ -1748,7 +1718,7 @@ def indicator_choropleth(values: pd.Series, names: pd.Series, spec: dict, *,
     v = values.dropna()
     scale = spec.get("map_scale")
     lo, hi = z_range
-    colorbar = dict(thickness=12, len=0.7, tickfont=AXIS_TEXT, outlinewidth=0)
+    colorbar = dict(MAP_COLORBAR)
     if scale == "log":
         # The scale starts at the smallest positive value: a reported 0 (e.g. CO2 of a tiny
         # territory) would otherwise stretch it down to 1e-9. Zeros get the lowest color.
@@ -1820,7 +1790,7 @@ def change_choropleth(change: pd.Series, names: pd.Series, spec: dict, *, unit: 
     """
     v = change.dropna()
     max_abs = float(v.abs().max()) if len(v) else 0.0
-    colorbar = dict(thickness=12, len=0.7, tickfont=AXIS_TEXT, outlinewidth=0)
+    colorbar = dict(MAP_COLORBAR)
     if spec.get("map_scale") in ("log", "signed_log"):
         z, (zmin, zmax, zmid), ticks = _signed_log_z(v, max_abs)
         colorbar.update(ticks)
@@ -2093,8 +2063,11 @@ def tab_distributions(data: pd.DataFrame, countries: pd.DataFrame, errors: dict[
     end_col.selectbox("End year", key=end_key, **year_field)
     reset_col.button("Reset to default", key=f"dist_years_reset_{label}", on_click=reset_years,
                      disabled=not remembered, help="Return every indicator to its own default years.")
+    # du.series_split is the last observed year + 0.5 (inf without projections)
+    first_projected = int(split + 0.5) if split < math.inf else None
+    projection_note = f"Values from {first_projected} on are projections."  # for the footers
     if years[-1] > split:  # this indicator has projections: say from which year
-        note_col.caption(f"From {int(split + 0.5)} onward, values are projections.")
+        note_col.caption(f"From {first_projected} onward, values are projections.")
     ya, yb = st.slider("Select two years to compare country distributions", min_value=years[0],
                        max_value=years[-1], step=1, key=key, label_visibility="collapsed",
                        on_change=lambda: remember(st.session_state[key]))
@@ -2111,18 +2084,19 @@ def tab_distributions(data: pd.DataFrame, countries: pd.DataFrame, errors: dict[
     if not dist.empty:
         st.space(DIST_BLOCK_GAP)
         html_title(*dist_bars_title(label, ya, yb), gap_below=False)
-        st.plotly_chart(distribution_bars(dist, spec["bins"], label, ya, yb, x_title=sentence_case(unit),
+        st.plotly_chart(distribution_bars(dist, spec["bins"], ya, yb, x_title=sentence_case(unit),
                                           x_suffix=suffix, vlines=spec.get("vlines"), band=spec.get("band")),
                         width="stretch")
         notes = [ds.ESTIMATE_NOTES.get(spec["series"]), spec.get("bins_note"), spec.get("note"),
-                 f"Values from {int(split + 0.5)} on are projections." if max(ya, yb) > split else None]
+                 projection_note if max(ya, yb) > split else None]
         source_footer(note=" ".join(n for n in notes if n) or None, source=source)
 
     # 2. Map: either year (each on its own color scale) or the change. Its title depends on the
     # map mode, so a placeholder keeps it above the toggle and it's filled in once the mode is known.
     st.space(DIST_BLOCK_GAP)
     map_title = st.empty()
-    names = countries.set_index("country_code")["country_name"]
+    meta = countries.set_index("country_code")
+    names = meta["country_name"]
     change_unit = " pp" if suffix == "%" else ""  # a difference of two percentages: percentage points
     modes = [*sorted({ya, yb}), "change"]
     map_mode = st.segmented_control("Select map mode", modes, required=True, key=f"dist_map_mode_{label}_{ya}_{yb}",
@@ -2145,7 +2119,7 @@ def tab_distributions(data: pd.DataFrame, countries: pd.DataFrame, errors: dict[
     # 3. Table: both years plus the change between them, headed like the charts
     st.space(DIST_BLOCK_GAP)
     html_title("Country Details", f"{label} ({unit}), {years_text([ya, yb])}, and the change between them")
-    meta = countries.set_index("country_code")[["iso2_code", "country_name", "region", "income_group"]]
+    meta = meta[["iso2_code", "country_name", "region", "income_group"]]
     table = meta.loc[meta.index.intersection(wide.index)].assign(
         value_a=wide[ya], value_b=wide[yb],
     ).dropna(subset=["value_a", "value_b"], how="all")
@@ -2156,8 +2130,8 @@ def tab_distributions(data: pd.DataFrame, countries: pd.DataFrame, errors: dict[
         income_group=table["income_group"].str.replace(" income", "", regex=False),
         flag=table["iso2_code"].map(flag_image),
     )
-    table = with_short_regions(table)
-    table["region"] = table["region"].map(lambda r: [r] if isinstance(r, str) else [])
+    # Region pills (region_pill_column): a list of one short region name
+    table["region"] = table["region"].map(lambda r: [REGION_SHORT_LABEL.get(r, r)] if isinstance(r, str) else [])
     col_a, col_b = f"{ya}", f"{yb}" if yb != ya else f"{yb} "
     styler = (
         table[["flag", "country_name", "region", "income_group", "value_a", "value_b", "change"]]
@@ -2192,10 +2166,10 @@ def tab_distributions(data: pd.DataFrame, countries: pd.DataFrame, errors: dict[
                                     required=True, key=f"dist_box_fit_{label}") == "Yes"
     show_mean = mean_col.segmented_control("Mean", ["Show", "Hide"], default="Show", required=True,
                                            key=f"dist_box_mean_{label}") == "Show"
-    st.plotly_chart(distribution_boxes(stats, outliers, label, unit, split=split, log=log, fmt=fmt, suffix=suffix,
+    st.plotly_chart(distribution_boxes(stats, outliers, split=split, log=log, fmt=fmt, suffix=suffix,
                                        fit=fit, show_mean=show_mean), width="stretch")
     notes = [ds.ESTIMATE_NOTES.get(spec["series"]),
-             f"Values from {int(split + 0.5)} on are projections." if stats.index.max() > split else None,
+             projection_note if stats.index.max() > split else None,
              (f"{hidden} {'country' if hidden == 1 else 'countries'} with a value of 0 in some years "
               f"{'is' if hidden == 1 else 'are'} not shown for those years (log scale).") if hidden else None]
     source_footer(note=" ".join(n for n in notes if n) or None, source=source)

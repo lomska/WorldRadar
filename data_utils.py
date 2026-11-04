@@ -46,6 +46,7 @@ import os
 import shutil
 import threading
 import time
+import weakref
 from pathlib import Path
 
 import pandas as pd
@@ -55,7 +56,7 @@ import streamlit as st
 import country_dict as cd
 import sources as ds
 
-REQUEST_TIMEOUT = 60
+COUNTRIES_TIMEOUT = 60  # read timeout of fetch_countries' one request
 CACHE_TTL_SECONDS = 60 * 60 * 24  # 24h -- shared by st.cache_data and the on-disk cache
 
 # A shared Session reuses TCP/TLS connections across the requests to each host. Every source's
@@ -76,7 +77,6 @@ _EXPIRED_MARKER = _CACHE_DIR / "expired_before"
 # Every series the app can chart (code -> name) and every source (key -> label), from sources.py.
 SERIES: dict[str, str] = ds.SERIES
 SOURCE_LABELS: dict[str, str] = {key: source["label"] for key, source in ds.SOURCES.items()}
-POPULATION_SOURCE = ds.POPULATION  # "POP": the population data's key, as in load_data()'s errors
 COUNTRIES_SOURCE = "COUNTRIES"  # the /country list's key in load_countries()'s errors
 
 # Population series the transforms below compute with.
@@ -89,22 +89,9 @@ WORLD_CODE = "WLD"
 # come straight from the data, and REGION_COLOR_MAP is keyed by these values, so a stale
 # name silently renders that region grey. (The World Bank renamed MEA from "Middle East &
 # North Africa" to its current name.) Display-only short names: app.REGION_SHORT_LABEL.
-REGION_CODES: dict[str, str] = {
-    "EAS": "East Asia & Pacific",
-    "ECS": "Europe & Central Asia",
-    "LCN": "Latin America & Caribbean",
-    "MEA": "Middle East, North Africa, Afghanistan & Pakistan",
-    "NAC": "North America",
-    "SAS": "South Asia",
-    "SSF": "Sub-Saharan Africa",
-}
-
-INCOME_CODES: dict[str, str] = {
-    "HIC": "High income",
-    "UMC": "Upper middle income",
-    "LMC": "Lower middle income",
-    "LIC": "Low income",
-}
+# Names from country_dict.py.
+REGION_CODES: dict[str, str] = {c: cd.COUNTRIES[c] for c in ("EAS", "ECS", "LCN", "MEA", "NAC", "SAS", "SSF")}
+INCOME_CODES: dict[str, str] = {c: cd.COUNTRIES[c] for c in ("HIC", "UMC", "LMC", "LIC")}
 
 # Colors: #2057a7 (blue) and #f2bc40 (yellow) are the two primary colors (first and second series), with a set
 # of grays for gridlines, captions and text; chart style: app.style_fig.
@@ -164,12 +151,27 @@ DERIVED_FROM: dict[str, str] = {BIRTHS: BIRTH_RATE, DEATHS: DEATH_RATE, NATURAL_
                                 NATURAL_CHANGE_RATE: BIRTH_RATE, NET_MIGRATION_RATE: NET_MIGRATION}
 
 
+# Fingerprints of the big tables (load_data()'s), by object: a Trends run passes the same table to about
+# six cached calls, each fingerprint costing a few ms. Only tables of at least _FP_MEMO_ROWS rows: that is
+# the data table, which is never changed in place (each run gets its own copy from st.cache_data). Weak
+# references, so a finished run's table isn't kept alive; its entry goes with it.
+_FP_MEMO: dict[int, tuple[weakref.ref, tuple]] = {}
+_FP_MEMO_ROWS = 100_000
+
+
 def _fast_df_fingerprint(d: pd.DataFrame):
     """Cheap stand-in for st.cache_data's default DataFrame hash (shape + column
     names + a sum over numeric columns) -- see the module docstring for why."""
+    hit = _FP_MEMO.get(id(d))
+    if hit is not None and hit[0]() is d:
+        return hit[1]
     numeric = d.select_dtypes("number")
     numeric_sum = float(numeric.sum().sum()) if not numeric.empty else 0.0
-    return (d.shape, tuple(d.columns), numeric_sum)
+    fingerprint = (d.shape, tuple(d.columns), numeric_sum)
+    if len(d) >= _FP_MEMO_ROWS:
+        key = id(d)
+        _FP_MEMO[key] = (weakref.ref(d, lambda _, key=key: _FP_MEMO.pop(key, None)), fingerprint)
+    return fingerprint
 
 
 # Passed as hash_funcs to every @st.cache_data transform below that takes a table.
@@ -192,49 +194,43 @@ def _expired_before() -> float:
         return 0.0
 
 
-def _cache_age_seconds(*files: Path) -> float | None:
-    """Age of the OLDEST of the given files in seconds, or None if any of them don't exist
-    yet -- so a partially-written cache set never reads as fresher than it really is."""
-    if not all(f.exists() for f in files):
-        return None
-    return time.time() - min(f.stat().st_mtime for f in files)
-
-
-def _read_parquet_if_fresh(*files: Path) -> list[pd.DataFrame] | None:
-    """Read all of `files` as parquet if they exist and are within the TTL, else None."""
-    age = _cache_age_seconds(*files)
-    if age is None or age > CACHE_TTL_SECONDS:
-        return None
-    if min(f.stat().st_mtime for f in files) <= _expired_before():  # expired by "Refresh data"
-        return None
+def _read_parquet_if_fresh(f: Path) -> pd.DataFrame | None:
+    """`f` as parquet if it is within the TTL and not expired by "Refresh data", else None (also if it is
+    missing or unreadable)."""
     try:
-        return [pd.read_parquet(f) for f in files]
-    except Exception:  # noqa: BLE001 -- a corrupt/unreadable cache just means "fetch over the network instead"
+        mtime = f.stat().st_mtime
+        if time.time() - mtime > CACHE_TTL_SECONDS or mtime <= _expired_before():
+            return None
+        return pd.read_parquet(f)
+    except Exception:  # noqa: BLE001 -- a missing/corrupt cache just means "fetch over the network instead"
         return None
 
 
-def _write_parquet_atomic(file_df_pairs: list[tuple[Path, pd.DataFrame]]) -> None:
+def _write_parquet_atomic(f: Path, df: pd.DataFrame) -> None:
     """Best-effort write-through to disk. Never raises -- a read-only filesystem just means
-    no speedup next time. Writes to temp files then renames, so a process that crashes
+    no speedup next time. Writes to a temp file then renames, so a process that crashes
     mid-write (or another session reading concurrently) never sees a half-written file."""
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp_pairs = [(f, f.with_suffix(".tmp"), df) for f, df in file_df_pairs]
-        for _, tmp, df in tmp_pairs:
-            df.to_parquet(tmp, index=False)
-        for f, tmp, _ in tmp_pairs:
-            tmp.replace(f)
+        tmp = f.with_suffix(".tmp")
+        df.to_parquet(tmp, index=False)
+        tmp.replace(f)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _forget_in_memory() -> None:
+    """Drop the release dates and stale-source notes kept in memory (both cache resets)."""
+    with _UPDATES_LOCK:
+        _UPDATES.clear()
+        _STALE.clear()
 
 
 def clear_disk_cache() -> None:
     """Delete the whole on-disk cache (every source, the country list and the release dates), leaving no
     fallback. The tests use it to start clean; the app's "Refresh data" uses expire_disk_cache()."""
     shutil.rmtree(_CACHE_DIR, ignore_errors=True)
-    with _UPDATES_LOCK:
-        _UPDATES.clear()
-        _STALE.clear()
+    _forget_in_memory()
 
 
 # Cache files from before the 2026-10-12 refactor: no longer read, so "Refresh data" deletes them.
@@ -254,9 +250,7 @@ def expire_disk_cache() -> None:
                 f.unlink(missing_ok=True)
     except Exception:  # noqa: BLE001 -- a read-only filesystem: nothing on disk to expire
         pass
-    with _UPDATES_LOCK:
-        _UPDATES.clear()
-        _STALE.clear()
+    _forget_in_memory()
 
 
 # --------------------------------------------------------------------------
@@ -320,7 +314,7 @@ def fetch_countries() -> pd.DataFrame:
     url = f"{ds.WB_API_BASE}/country"
     params = {"format": "json", "per_page": 400}
     try:
-        resp = _SESSION.get(url, params=params, timeout=(ds.CONNECT_TIMEOUT, REQUEST_TIMEOUT))
+        resp = _SESSION.get(url, params=params, timeout=(ds.CONNECT_TIMEOUT, COUNTRIES_TIMEOUT))
         resp.raise_for_status()
         payload = resp.json()
     except Exception as exc:  # noqa: BLE001
@@ -361,17 +355,14 @@ def _read_countries_cache(fresh_only: bool = True) -> pd.DataFrame | None:
     """The on-disk country list: only if still fresh (fresh_only), or whatever its age (the fallback when
     the endpoint is down). None if missing, unreadable, or written before a column was added (iso2_code,
     for the flags): such a file is a miss, so it self-heals on the next load."""
-    try:
-        if fresh_only:
-            result = _read_parquet_if_fresh(_COUNTRIES_CACHE_FILE)
-            if result is None:
-                return None
-            (countries,) = result
-        else:
+    if fresh_only:
+        countries = _read_parquet_if_fresh(_COUNTRIES_CACHE_FILE)
+    else:
+        try:
             countries = pd.read_parquet(_COUNTRIES_CACHE_FILE)
-    except Exception:  # noqa: BLE001 -- missing or corrupt
-        return None
-    if countries.empty or not set(COUNTRIES_COLUMNS) <= set(countries.columns):
+        except Exception:  # noqa: BLE001 -- missing or corrupt
+            return None
+    if countries is None or countries.empty or not set(COUNTRIES_COLUMNS) <= set(countries.columns):
         return None
     return _clean_countries(countries)  # files written before the strip was added
 
@@ -412,7 +403,7 @@ def load_countries() -> tuple[pd.DataFrame, dict[str, str]]:
         countries = fetch_countries()
     except Exception as exc:  # noqa: BLE001 -- reported in the app
         return fallback_countries(), {COUNTRIES_SOURCE: f"{type(exc).__name__}: {exc}"}
-    _write_parquet_atomic([(_COUNTRIES_CACHE_FILE, countries)])
+    _write_parquet_atomic(_COUNTRIES_CACHE_FILE, countries)
     return countries, {}
 
 
@@ -432,11 +423,8 @@ def _read_source_cache(source: str) -> pd.DataFrame | None:
     series would be trusted as complete, silently leaving that chart empty until the 24h TTL happened to
     expire or someone clicked "Refresh data". Now a cache like that is a miss, so a redeploy self-heals
     on its very next load."""
-    result = _read_parquet_if_fresh(_source_cache_file(source))
-    if result is None:
-        return None
-    (table,) = result
-    if not set(ds.series_of(source)) <= set(table["series_code"].unique()):
+    table = _read_parquet_if_fresh(_source_cache_file(source))
+    if table is None or not set(ds.series_of(source)) <= set(table["series_code"].unique()):
         return None
     if not _cached_update(source):  # written before release dates were added: refetched
         return None
@@ -477,13 +465,11 @@ def load_data() -> tuple[pd.DataFrame, dict[str, str]]:
     """
     with _UPDATES_LOCK:
         _STALE.clear()
-    frames, errors, missing = [], {}, []
-    for source in ds.SOURCES:
-        cached = _read_source_cache(source)
-        if cached is None:
-            missing.append(source)
-        else:
-            frames.append(cached)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ds.SOURCES)) as executor:
+        cached = dict(zip(ds.SOURCES, executor.map(_read_source_cache, ds.SOURCES)))  # parquet reads release the GIL
+    frames = [table for table in cached.values() if table is not None]
+    missing = [source for source, table in cached.items() if table is None]
+    errors = {}
     if missing:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(missing)) as executor:
             futures = {s: executor.submit(ds.SOURCES[s]["fetch"], _SESSION) for s in missing}
@@ -495,14 +481,15 @@ def load_data() -> tuple[pd.DataFrame, dict[str, str]]:
                     stale = _read_stale_source(source)
                     if stale is None:
                         errors[source] = message
-                    else:
-                        frames.append(stale[0])
-                        with _UPDATES_LOCK:
-                            _STALE[source] = (stale[1], message)
-                    continue
-                frames.append(table)
-                _write_parquet_atomic([(_source_cache_file(source), table)])
-                _record_update(source, updated)
+                        continue
+                    table, saved = stale
+                    frames.append(table)
+                    with _UPDATES_LOCK:
+                        _STALE[source] = (saved, message)
+                else:
+                    frames.append(table)
+                    _write_parquet_atomic(_source_cache_file(source), table)
+                    _record_update(source, updated)
     data = pd.concat(frames, ignore_index=True) if frames else empty_data()
     return data, errors
 
@@ -553,7 +540,7 @@ def trends_data(data: pd.DataFrame, entity_code: str) -> pd.DataFrame:
     year-indexed: one column per SERIES code (all present, empty where a source has no data for this
     entity), plus the derived BIRTHS, DEATHS and NATURAL_INCREASE columns.
     """
-    sub = data[data["country_code"] == entity_code]
+    sub = data.loc[data["country_code"] == entity_code, ["year", "series_code", "value"]]
     if sub.empty:
         wide = pd.DataFrame(columns=list(SERIES), dtype=float)
     else:
@@ -593,8 +580,9 @@ def series_ranges(data: pd.DataFrame) -> pd.DataFrame:
 
 # The last table series_split() saw and its projection_starts(): a run asks once per chart, and even a
 # cache hit fingerprints the whole table, so the lookup is kept for as long as the same table object is
-# passed (one run: st.cache_data hands each run its own copy). One entry, replaced atomically.
-_LAST_SPLITS: tuple[pd.DataFrame | None, dict[str, float]] = (None, {})
+# passed (one run: st.cache_data hands each run its own copy). One entry, replaced atomically; a weak
+# reference, so the table isn't kept alive after its run.
+_LAST_SPLITS: tuple[weakref.ref | None, dict[str, float]] = (None, {})
 
 
 def series_split(series_code: str, data: pd.DataFrame) -> float:
@@ -602,9 +590,9 @@ def series_split(series_code: str, data: pd.DataFrame) -> float:
     computed from), or math.inf for a series without projections."""
     global _LAST_SPLITS
     table, splits = _LAST_SPLITS
-    if table is not data:
+    if table is None or table() is not data:
         splits = projection_starts(data)
-        _LAST_SPLITS = (data, splits)
+        _LAST_SPLITS = (weakref.ref(data), splits)
     return splits.get(DERIVED_FROM.get(series_code, series_code), math.inf)
 
 
@@ -624,6 +612,7 @@ def country_indicator_wide(data: pd.DataFrame, countries: pd.DataFrame, series_c
                 / country_indicator_wide(data, countries, POP_TOTAL) * 1000)
     else:
         codes = real_country_codes(countries)
-        sub = data[(data["series_code"] == series_code) & (data["country_code"].isin(codes))]
+        sub = data.loc[data["series_code"] == series_code, ["country_code", "year", "value"]]
+        sub = sub[sub["country_code"].isin(codes)]
         wide = sub.pivot_table(index="country_code", columns="year", values="value")
     return wide.dropna(axis=1, how="all")

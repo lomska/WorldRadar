@@ -11,6 +11,7 @@ __pycache__/
 
 # Local working notes for Claude Code sessions: not part of the published app.
 CLAUDE.md
+CLEANUP_BACKLOG.md
 
 # Notebook-era data files, in case a local copy is still around: the first is 375 MB (over
 # GitHub's 100 MB file limit), the second holds data from sources that may not be redistributed

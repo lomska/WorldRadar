@@ -52,7 +52,7 @@ def boxes(n_years, split=np.inf, **kw):
                      index=pd.Index([f"C{i}" for i in range(30)], name="country_code"))
     names = pd.DataFrame({"country_code": w.index, "country_name": w.index})
     st_, out, _ = app_mod.yearly_box_stats(w, names, False)
-    return st_, app_mod.distribution_boxes(st_, out, "Real GDP growth", "percent", split=split, log=False,
+    return st_, app_mod.distribution_boxes(st_, out, split=split, log=False,
                                            fmt=",.1f", suffix="%", **kw)
 
 

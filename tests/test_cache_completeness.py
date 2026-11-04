@@ -48,7 +48,7 @@ with patch.object(du._SESSION, "get", side_effect=counting_fake_get):
     pop = data[data["series_code"].str.startswith("POP:")]
     old_style = pop[pop["series_code"] != "POP:SP.POP.1564.TO.ZS"]
     assert set(old_style["series_code"]) < set(ds.series_of(ds.POPULATION)), "the fixture must be incomplete"
-    du._write_parquet_atomic([(du._source_cache_file(ds.POPULATION), old_style)])
+    du._write_parquet_atomic(du._source_cache_file(ds.POPULATION), old_style)
 
     # A fresh "process restart": in-memory caches cold, but the incomplete disk cache is
     # sitting there with a fresh mtime -- exactly the reported bug's starting condition.
@@ -85,7 +85,7 @@ with patch.object(du._SESSION, "get", side_effect=counting_fake_get):
 
     # The country list's own self-heal: a file written before iso2_code (the flags) was added.
     countries, _ = du.load_countries()
-    du._write_parquet_atomic([(du._COUNTRIES_CACHE_FILE, countries.drop(columns="iso2_code"))])
+    du._write_parquet_atomic(du._COUNTRIES_CACHE_FILE, countries.drop(columns="iso2_code"))
     du.load_countries.clear()
     n_before = len(calls)
     countries2, errors = du.load_countries()

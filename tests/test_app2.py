@@ -187,7 +187,7 @@ FAKE_SWIID_COMMIT = "2026-01-08T15:45:34Z"
 FAKE_PIP_VERSIONS = ["20261001_2017_01_02_PROD",  # a newer release in 2017 PPP: not the data's
                      "20260922_2021_01_02_PROD", "20260324_2021_01_02_PROD"]
 # What du.source_updates() should return for these fakes (ND-GAIN, WHR, UNDP: stored constants).
-EXPECTED_RELEASES = {du.POPULATION_SOURCE: dt.date(2026, 7, 1), "WDI": dt.date(2026, 9, 15),
+EXPECTED_RELEASES = {ds.POPULATION: dt.date(2026, 7, 1), "WDI": dt.date(2026, 9, 15),
                      "IMF": dt.date(2025, 10, 14), "NDGAIN": ds.NDGAIN_RELEASED, "WHR": ds.WHR_RELEASED,
                      "ECI": dt.date(2026, 2, 8), "UNDP": ds.UNDP_RELEASED, "ILO": dt.date(2026, 3, 20),
                      "SWIID": dt.date(2026, 1, 8), "PIP": dt.date(2026, 9, 22)}
@@ -533,12 +533,12 @@ def run():
         for section, label in views:
             assert label in app_mod.DISTRIBUTION_SECTIONS.get(section, {}), (section, label)
         view_source = {v: ds.source_of(app_mod.DISTRIBUTION_SECTIONS[v[0]][v[1]]["series"]) for v in views}
-        assert list(view_source.values()) == ["IMF", du.POPULATION_SOURCE, "ILO", "SWIID", "NDGAIN",
+        assert list(view_source.values()) == ["IMF", ds.POPULATION, "ILO", "SWIID", "NDGAIN",
                                               "UNDP", "ECI", "WHR"], view_source
         for available, expected in [({"ILO", "UNDP"}, ("Labour market", "Youth NEET rate")),
                                     (set(), views[0]),
                                     ({"WHR"}, ("Living standards", "Happiness: life evaluation")),
-                                    ({"WHR", du.POPULATION_SOURCE}, ("Demographics", "Birth rate")),
+                                    ({"WHR", ds.POPULATION}, ("Demographics", "Birth rate")),
                                     (set(view_source.values()), views[0])]:
             got = app_mod.first_available_view(lambda s, l: view_source[(s, l)] in available)
             assert got == expected, (available, got)
@@ -660,7 +660,7 @@ def run():
             width = spec["bins"][1]
             vals = pd.DataFrame({2000: np.linspace(0, 40, 81), 2020: np.linspace(0.5, 30, 81)})
             dist = app_mod.distribution_counts(vals, spec["bins"])
-            fig = app_mod.distribution_bars(dist, spec["bins"], label, 2000, 2020, x_title="x",
+            fig = app_mod.distribution_bars(dist, spec["bins"], 2000, 2020, x_title="x",
                                             vlines=spec.get("vlines"), band=spec.get("band"))
             left = float(dist.index[0]) - width / 2
 
