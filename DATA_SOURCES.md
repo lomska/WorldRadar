@@ -198,4 +198,5 @@ fill in once the download is done.
 
 The round flags in the Country Details table and the Country Profiles header are from
 [circle-flags](https://github.com/HatScripts/circle-flags) by HatScripts, version 2.8.0, used under the
-MIT License. The files are in `flags/`, with the licence in `flags/LICENSE.md`.
+MIT License. The files are in `flags/`, with the licence in `flags/LICENSE.md`; `static/flags/` holds
+copies padded for the table's rows (made by `make_static_flags.py`), with the same licence.

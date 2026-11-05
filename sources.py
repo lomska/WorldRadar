@@ -373,6 +373,42 @@ ESTIMATES_SERIES = "SP.POP.TOTL"
 LAST_ESTIMATE_URL = WB_API_BASE + "/country/WLD/indicator/" + ESTIMATES_SERIES
 
 
+COUNTRIES_COLUMNS = ["country_code", "iso2_code", "country_name", "region", "income_group", "is_aggregate"]
+
+
+def fetch_countries(session) -> pd.DataFrame:
+    """The country list (reference data, not a source of series): every country and aggregate from the
+    World Bank /country endpoint, with its region, income group and ISO2 code (for the flags).
+    data_utils.load_countries() caches it and falls back when it fails."""
+    payload = _get(session, WB_API_BASE + "/country", timeout=60, format="json", per_page=400).json()
+    if not isinstance(payload, list) or len(payload) < 2:
+        raise ValueError(f"unexpected response from the World Bank /country endpoint: {str(payload)[:200]}")
+    rows = []
+    for rec in payload[1]:
+        region_id = rec.get("region", {}).get("id", "NA")
+        income_id = rec.get("incomeLevel", {}).get("id", "NA")
+        rows.append({
+            "country_code": rec["id"],
+            "iso2_code": rec.get("iso2Code") or None,  # flag files are keyed by ISO2
+            "country_name": rec["name"],
+            # Aggregates (regions, income groups, "World") have region/incomeLevel id == "NA".
+            "region": rec["region"]["value"] if region_id != "NA" else None,
+            "income_group": rec["incomeLevel"]["value"] if income_id != "NA" else None,
+            "is_aggregate": region_id == "NA",
+        })
+    return clean_countries(pd.DataFrame(rows, columns=COUNTRIES_COLUMNS))
+
+
+def clean_countries(countries: pd.DataFrame) -> pd.DataFrame:
+    """The /country endpoint pads some region names with a trailing space ("Sub-Saharan
+    Africa ", "Latin America & Caribbean "), unlike the region names in the indicator
+    data. Strip them so region names match everywhere (color maps, short labels). The aggregates'
+    own names are padded too ("Sub-Saharan Africa " as the name of SSF), so those as well."""
+    return countries.assign(**{
+        col: countries[col].str.strip() for col in ("region", "income_group", "country_name") if col in countries
+    })
+
+
 def _pop_one(session, code: str, cancel: threading.Event | None = None) -> tuple[pd.DataFrame, dt.date | None]:
     """One series, every entity and year, plus the "lastupdated" date the API sends with it. Handles
     pagination, though one request with a large per_page normally returns everything."""

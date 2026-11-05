@@ -2,7 +2,7 @@
 Regression test: region names from country metadata must match REGION_COLOR_MAP's keys
 (and app.REGION_SHORT_LABEL's), or the Distributions table's region pills silently lose
 their color / short name. The real /country endpoint pads some region names with a
-trailing space ("Sub-Saharan Africa "); du._clean_countries strips them, and the
+trailing space ("Sub-Saharan Africa "); ds.clean_countries strips them, and the
 test_app2 fixture keeps that trailing space on purpose so this test guards it.
 """
 import _pathfix  # noqa: F401

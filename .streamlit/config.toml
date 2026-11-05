@@ -2,3 +2,8 @@
 # #2057a7 (the app's primary color) for widgets: sliders, radio buttons, tabs.
 # Fonts stay Streamlit's own.
 primaryColor = "#2057a7"
+
+[server]
+# Serves static/ at app/static/: the Distributions table's flags (static/flags/, make_static_flags.py),
+# which the browser fetches once and caches instead of receiving them in every table update.
+enableStaticServing = true

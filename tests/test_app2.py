@@ -22,7 +22,7 @@ COUNTRIES = [
      "incomeLevel": {"id": "HIC", "value": "High income"}},
     {"id": "CHN", "name": "China", "region": {"id": "EAS", "value": "East Asia & Pacific"},
      "incomeLevel": {"id": "UMC", "value": "Upper middle income"}},
-    # Trailing space on purpose: the real /country endpoint returns it (see du._clean_countries).
+    # Trailing space on purpose: the real /country endpoint returns it (see ds.clean_countries).
     {"id": "NGA", "name": "Nigeria", "region": {"id": "SSF", "value": "Sub-Saharan Africa "},
      "incomeLevel": {"id": "LMC", "value": "Lower middle income"}},
     {"id": "IND", "name": "India", "region": {"id": "SAS", "value": "South Asia"},
@@ -595,12 +595,11 @@ def run():
         top = xt[["WB:NY.GDP.PCAP.PP.KD", "WB:NY.GNP.PCAP.PP.KD"]].max().max()
         assert ranges[0] == ranges[1] and ranges[0][0] == 0 and ranges[0][1] > top, (ranges, top)
         # The Economic Complexity Index's y-axis is symmetric around 0 (the world average) on one fixed
-        # scale (+-2.5, plus the usual 10% headroom) for every country; bounded scores stay within their scale.
+        # scale (+-2.5, plus the usual 10% headroom) for every country.
         eci = next(s for s in app_mod.industry_charts(xt, data) if s["title"] == "Economic Complexity Index")
         lo, hi = eci["chart_fn"](eci["lines"], eci["colors"], title="x", **eci["kw"]).layout.yaxis.range
         assert xt["ECI:ECI"].abs().max() < app_mod.ECI_SCALE and (lo, hi) == (-2.75, 2.75), (lo, hi)
         assert app_mod.symmetric_axis(-2.9, -1.7, 0)["range"][0] < -2.9
-        assert app_mod.symmetric_axis(5, 99, 50)["range"] == [0, 100]
         print("OK: every source")
 
         # Reference marks: each on its Trends chart (if it has one) and its Distributions histogram,

@@ -58,7 +58,6 @@ import streamlit as st
 import country_dict as cd
 import sources as ds
 
-COUNTRIES_TIMEOUT = 60  # read timeout of fetch_countries' one request
 CACHE_TTL_SECONDS = 60 * 60 * 24  # 24h -- shared by st.cache_data and the on-disk cache
 
 # A shared Session reuses TCP/TLS connections across the requests to each host. Every source's
@@ -150,16 +149,34 @@ EDUCATION_SPENDING_BENCHMARK = (4, 6)  # % of GDP: Education 2030 Framework for 
 # --------------------------------------------------------------------------
 # Derived series: computed from the fetched ones, usable wherever a series code is
 # --------------------------------------------------------------------------
-# POP-prefixed, so sources.source_of() names the population data as their source. trends_data()
-# adds the first three as columns; country_indicator_wide() computes the two rates.
-BIRTHS = "POP:births"  # crude birth rate (per 1,000) * population / 1,000 (people)
-DEATHS = "POP:deaths"  # crude death rate (per 1,000) * population / 1,000 (people)
-NATURAL_INCREASE = "POP:natural_increase"  # births - deaths (people)
-NATURAL_CHANGE_RATE = "POP:natural_change_rate"  # crude birth rate - crude death rate (per 1,000)
-NET_MIGRATION_RATE = "POP:net_migration_rate"  # net migration / total population * 1,000
+# POP-prefixed, so sources.source_of() names the population data as their source.
+BIRTHS = "POP:births"
+DEATHS = "POP:deaths"
+NATURAL_INCREASE = "POP:natural_increase"
+NATURAL_CHANGE_RATE = "POP:natural_change_rate"
+NET_MIGRATION_RATE = "POP:net_migration_rate"
+# The one definition of each: code -> (input codes, how they combine, whether trends_data() adds it as a
+# column). Inputs may be derived themselves (listed earlier). country_indicator_wide() computes any of them
+# from its inputs' tables; a value exists only where every input has one (birth/death rates are projected
+# only every 5 years, so these are too).
+DERIVED: dict[str, tuple[tuple[str, ...], callable, bool]] = {
+    BIRTHS: ((BIRTH_RATE, POP_TOTAL), lambda rate, pop: rate * pop / 1000, True),  # people
+    DEATHS: ((DEATH_RATE, POP_TOTAL), lambda rate, pop: rate * pop / 1000, True),  # people
+    NATURAL_INCREASE: ((BIRTHS, DEATHS), lambda births, deaths: births - deaths, True),  # people
+    NATURAL_CHANGE_RATE: ((BIRTH_RATE, DEATH_RATE), lambda births, deaths: births - deaths, False),  # per 1,000
+    NET_MIGRATION_RATE: ((NET_MIGRATION, POP_TOTAL), lambda migration, pop: migration / pop * 1000, False),
+}
+
+
+def _split_source(code: str) -> str:
+    """The fetched series a derived one's forecast split follows: its first input, all the way down."""
+    while code in DERIVED:
+        code = DERIVED[code][0][0]
+    return code
+
+
 # Each derived series' projections start where the series it's computed from start (series_split).
-DERIVED_FROM: dict[str, str] = {BIRTHS: BIRTH_RATE, DEATHS: DEATH_RATE, NATURAL_INCREASE: BIRTH_RATE,
-                                NATURAL_CHANGE_RATE: BIRTH_RATE, NET_MIGRATION_RATE: NET_MIGRATION}
+DERIVED_FROM: dict[str, str] = {code: _split_source(code) for code in DERIVED}
 
 
 # Fingerprints of the big tables (load_data()'s), by object: a Trends run passes the same table to about
@@ -189,10 +206,6 @@ def _fast_df_fingerprint(d: pd.DataFrame):
 _DF_HASH_FUNCS = {pd.DataFrame: _fast_df_fingerprint}
 
 
-class DataFetchError(RuntimeError):
-    """Raised when the World Bank API cannot be reached or returns something unexpected."""
-
-
 # --------------------------------------------------------------------------
 # On-disk cache helpers
 # --------------------------------------------------------------------------
@@ -217,17 +230,21 @@ def _read_parquet_if_fresh(f: Path) -> pd.DataFrame | None:
         return None
 
 
-def _write_parquet_atomic(f: Path, df: pd.DataFrame) -> None:
-    """Best-effort write-through to disk. Never raises -- a read-only filesystem just means
-    no speedup next time. Writes to a temp file then renames, so a process that crashes
-    mid-write (or another session reading concurrently) never sees a half-written file."""
+def _atomic_write(f: Path, write) -> None:
+    """Best-effort write-through to disk: write(tmp path), then rename onto f. Never raises -- a read-only
+    filesystem just means no speedup next time. The rename means a process that crashes mid-write (or
+    another session reading concurrently) never sees a half-written file."""
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = f.with_suffix(".tmp")
-        df.to_parquet(tmp, index=False)
+        write(tmp)
         tmp.replace(f)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _write_parquet_atomic(f: Path, df: pd.DataFrame) -> None:
+    _atomic_write(f, lambda tmp: df.to_parquet(tmp, index=False))
 
 
 def _forget_in_memory() -> None:
@@ -236,6 +253,7 @@ def _forget_in_memory() -> None:
         _UPDATES.clear()
         _STALE.clear()
         _FAILED.clear()
+        _LOADED_GENERATIONS.clear()
 
 
 def clear_disk_cache() -> None:
@@ -307,6 +325,9 @@ _GENERATION: dict[str, int] = {DATA_KEY: 0, COUNTRIES_SOURCE: 0}
 _REFRESHING: set[str] = set()  # the keys being fetched in the background now
 _LOADING: set[str] = set()  # those of them with no copy to show meanwhile
 _REFRESH_THREADS: list[threading.Thread] = []
+# The generations load_data() has computed in this process (so their release dates are in _UPDATES):
+# source_updates() checks it instead of calling load_data() for a copy of the whole table.
+_LOADED_GENERATIONS: set[int] = set()
 
 
 def _take_wait_request(key: str) -> bool:
@@ -420,62 +441,14 @@ def _record_update(source: str, updated: dt.date | None) -> None:
     with _UPDATES_LOCK:
         _UPDATES[source] = updated
         merged = {k: v.isoformat() if v else None for k, v in {**_read_updates_file(), source: updated}.items()}
-        try:
-            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = _UPDATES_CACHE_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(merged, indent=1), encoding="utf-8")
-            tmp.replace(_UPDATES_CACHE_FILE)
-        except Exception:  # noqa: BLE001 -- a read-only filesystem: memory only
-            pass
+        _atomic_write(_UPDATES_CACHE_FILE, lambda tmp: tmp.write_text(json.dumps(merged, indent=1), encoding="utf-8"))
 
 
 # --------------------------------------------------------------------------
 # Country list (names, regions, income groups, ISO2 codes for the flags)
 # --------------------------------------------------------------------------
 
-COUNTRIES_COLUMNS = ["country_code", "iso2_code", "country_name", "region", "income_group", "is_aggregate"]
-
-
-def fetch_countries() -> pd.DataFrame:
-    """Country/region/income-group metadata from the World Bank /country endpoint."""
-    url = f"{ds.WB_API_BASE}/country"
-    params = {"format": "json", "per_page": 400}
-    try:
-        resp = _SESSION.get(url, params=params, timeout=(ds.CONNECT_TIMEOUT, COUNTRIES_TIMEOUT))
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as exc:  # noqa: BLE001
-        raise DataFetchError(f"Could not fetch country metadata from the World Bank API: {exc}") from exc
-
-    if not isinstance(payload, list) or len(payload) < 2:
-        raise DataFetchError("Unexpected response shape from the World Bank /country endpoint.")
-
-    rows = []
-    for rec in payload[1]:
-        region_id = rec.get("region", {}).get("id", "NA")
-        income_id = rec.get("incomeLevel", {}).get("id", "NA")
-        rows.append(
-            {
-                "country_code": rec["id"],
-                "iso2_code": rec.get("iso2Code") or None,  # for flag images (flag files are keyed by ISO2)
-                "country_name": rec["name"],
-                # Aggregates (regions, income groups, "World") have region/incomeLevel id == "NA".
-                "region": rec["region"]["value"] if region_id != "NA" else None,
-                "income_group": rec["incomeLevel"]["value"] if income_id != "NA" else None,
-                "is_aggregate": region_id == "NA",
-            }
-        )
-    return _clean_countries(pd.DataFrame(rows, columns=COUNTRIES_COLUMNS))
-
-
-def _clean_countries(countries: pd.DataFrame) -> pd.DataFrame:
-    """The /country endpoint pads some region names with a trailing space ("Sub-Saharan
-    Africa ", "Latin America & Caribbean "), unlike the region names in the indicator
-    data. Strip them so region names match everywhere (color maps, short labels). The aggregates'
-    own names are padded too ("Sub-Saharan Africa " as the name of SSF), so those as well."""
-    return countries.assign(**{
-        col: countries[col].str.strip() for col in ("region", "income_group", "country_name") if col in countries
-    })
+COUNTRIES_COLUMNS = ds.COUNTRIES_COLUMNS
 
 
 def _snapshot_copy(key: str, file_name: str) -> tuple[pd.DataFrame, dt.datetime] | None:
@@ -496,30 +469,39 @@ def _snapshot_update(key: str) -> tuple[bool, dt.date | None]:
         return False, None
 
 
+def _read_cache(key: str, f: Path, is_valid, fresh_only: bool) -> tuple[pd.DataFrame, dt.datetime, str] | None:
+    """The one reader of saved copies, for a source or COUNTRIES_SOURCE (key) cached in file f:
+    (table, when it was saved, "disk" or "snapshot") for the first copy that is_valid(table) accepts, else
+    None (also when missing or unreadable). fresh_only: the disk file only, and only within the TTL and not
+    expired by "Refresh data" (a fresh cache hit). Otherwise the disk file whatever its age and the snapshot's
+    copy, the newer first (what is shown while a source is fetched, or when it can't be)."""
+    if fresh_only:
+        table = _read_parquet_if_fresh(f)
+        copies = [] if table is None else [(table, dt.datetime.fromtimestamp(f.stat().st_mtime), "disk")]
+    else:
+        copies = []
+        try:
+            copies.append((pd.read_parquet(f), dt.datetime.fromtimestamp(f.stat().st_mtime), "disk"))
+        except Exception:  # noqa: BLE001 -- missing or corrupt
+            pass
+        snapshot = _snapshot_copy(key, f.name)
+        if snapshot is not None:
+            copies.append((*snapshot, "snapshot"))
+        copies.sort(key=lambda c: c[1], reverse=True)
+    return next((copy for copy in copies if not copy[0].empty and is_valid(copy[0])), None)
+
+
+def _valid_countries(countries: pd.DataFrame) -> bool:
+    """A country list written before a column was added (iso2_code, for the flags) is a miss, so it
+    self-heals on the next load."""
+    return set(COUNTRIES_COLUMNS) <= set(countries.columns)
+
+
 def _read_countries_cache(fresh_only: bool = True) -> pd.DataFrame | None:
     """The on-disk country list: only if still fresh (fresh_only), or else the newer of the disk cache
-    (whatever its age) and the snapshot's. None if missing, unreadable, or written before a column was
-    added (iso2_code, for the flags): such a file is a miss, so it self-heals on the next load."""
-    def valid(countries):
-        if countries is None or countries.empty or not set(COUNTRIES_COLUMNS) <= set(countries.columns):
-            return None
-        return _clean_countries(countries)  # files written before the strip was added
-
-    if fresh_only:
-        return valid(_read_parquet_if_fresh(_COUNTRIES_CACHE_FILE))
-    copies = []
-    try:
-        copies.append((pd.read_parquet(_COUNTRIES_CACHE_FILE),
-                       dt.datetime.fromtimestamp(_COUNTRIES_CACHE_FILE.stat().st_mtime)))
-    except Exception:  # noqa: BLE001 -- missing or corrupt
-        pass
-    snapshot = _snapshot_copy(COUNTRIES_SOURCE, _COUNTRIES_CACHE_FILE.name)
-    if snapshot is not None:
-        copies.append(snapshot)
-    for countries, _ in sorted(copies, key=lambda c: c[1], reverse=True):
-        if valid(countries) is not None:
-            return valid(countries)
-    return None
+    (whatever its age) and the snapshot's. None if there is no valid copy (_valid_countries)."""
+    copy = _read_cache(COUNTRIES_SOURCE, _COUNTRIES_CACHE_FILE, _valid_countries, fresh_only)
+    return None if copy is None else ds.clean_countries(copy[0])  # files written before the strip was added
 
 
 def countries_from_dict() -> pd.DataFrame:
@@ -533,7 +515,7 @@ def countries_from_dict() -> pd.DataFrame:
 
 
 def fallback_countries() -> pd.DataFrame:
-    """The country list when fetch_countries() fails: the disk cache even if stale (or the snapshot's), else
+    """The country list when sources.fetch_countries() fails: the disk cache even if stale (or the snapshot's), else
     country_dict's."""
     stale = _read_countries_cache(fresh_only=False)
     return stale if stale is not None else countries_from_dict()
@@ -572,9 +554,9 @@ def load_countries(generation: int = 0) -> tuple[pd.DataFrame, dict[str, str]]:
 
 
 def _fetch_countries_to_disk() -> pd.DataFrame:
-    """fetch_countries(), written to disk; a failure is recorded in _FAILED and raised."""
+    """sources.fetch_countries(), written to disk; a failure is recorded in _FAILED and raised."""
     try:
-        countries = fetch_countries()
+        countries = ds.fetch_countries(_SESSION)
     except Exception as exc:
         with _UPDATES_LOCK:
             _FAILED[COUNTRIES_SOURCE] = (time.time(), f"{type(exc).__name__}: {exc}")
@@ -601,51 +583,53 @@ def _read_source_cache(source: str) -> pd.DataFrame | None:
     series would be trusted as complete, silently leaving that chart empty until the 24h TTL happened to
     expire or someone clicked "Refresh data". Now a cache like that is a miss, so a redeploy self-heals
     on its very next load (it is shown meanwhile, and refetched in the background)."""
-    table = _read_parquet_if_fresh(_source_cache_file(source))
-    if table is None or not set(ds.series_of(source)) <= set(table["series_code"].unique()):
+    def complete(table):
+        return _has_schema(table) and set(ds.series_of(source)) <= set(table["series_code"].unique())
+
+    copy = _read_cache(source, _source_cache_file(source), complete, fresh_only=True)
+    if copy is None or not _cached_update(source):  # no date: written before release dates were added
         return None
-    if not _cached_update(source):  # written before release dates were added: refetched
-        return None
-    return table
+    return copy[0]
+
+
+def _has_schema(table: pd.DataFrame) -> bool:
+    return set(ds.SCHEMA) <= set(table.columns)
 
 
 def _read_saved_copy(source: str) -> tuple[pd.DataFrame, dt.datetime] | None:
     """A copy of a source to show when it isn't fresh on disk: the newer of its disk cache (whatever its age)
-    and the snapshot's, with when it was saved; None if neither is readable. Its release date, if recorded,
-    goes in memory for source_updates()."""
-    copies = []
-    f = _source_cache_file(source)
-    try:
-        copies.append((pd.read_parquet(f), dt.datetime.fromtimestamp(f.stat().st_mtime), "disk"))
-    except Exception:  # noqa: BLE001 -- missing or corrupt
-        pass
-    snapshot = _snapshot_copy(source, f.name)
-    if snapshot is not None:
-        copies.append((*snapshot, "snapshot"))
-    for table, saved, where in sorted(copies, key=lambda c: c[1], reverse=True):
-        if table.empty or not set(ds.SCHEMA) <= set(table.columns):
-            continue
-        if where == "disk":
-            _cached_update(source)
-        else:
-            known, updated = _snapshot_update(source)
-            if known:
-                with _UPDATES_LOCK:
-                    _UPDATES[source] = updated
-        return table, saved
-    return None
+    and the snapshot's, with when it was saved; None if neither is readable. Unlike a fresh cache hit, it
+    needn't hold every series or a release date: an incomplete copy beats empty charts while the source is
+    fetched. Its release date, if recorded, goes in memory for source_updates()."""
+    copy = _read_cache(source, _source_cache_file(source), _has_schema, fresh_only=False)
+    if copy is None:
+        return None
+    table, saved, where = copy
+    if where == "disk":
+        _cached_update(source)
+    else:
+        known, updated = _snapshot_update(source)
+        if known:
+            with _UPDATES_LOCK:
+                _UPDATES[source] = updated
+    return table, saved
+
+
+# load_data()'s columns: sources.SCHEMA without the names, which nothing reads from the table (names come
+# from the country list and SERIES). That halves the table, and with it every cache hit's copy.
+DATA_COLUMNS = [c for c in ds.SCHEMA if c not in ("series_name", "country_name")]
 
 
 def empty_data() -> pd.DataFrame:
     """load_data()'s table with no rows."""
-    return pd.DataFrame(columns=ds.SCHEMA)
+    return pd.DataFrame(columns=DATA_COLUMNS)
 
 
 @_per_generation(DATA_KEY)
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False, max_entries=1)
 def load_data(generation: int = 0) -> tuple[pd.DataFrame, dict[str, str]]:
     """
-    Every source as one long table (sources.SCHEMA), plus {source key: error message} for the sources
+    Every source as one long table (DATA_COLUMNS: sources.SCHEMA without the names), plus {source key: error message} for the sources
     that failed; never raises; called without arguments (see _per_generation). A failure doesn't stop the
     app: the sources are separate publishers (some block scripted downloads from time to time). Each
     source is cached on disk separately; one that isn't fresh there is shown from its saved copy
@@ -689,7 +673,9 @@ def load_data(generation: int = 0) -> tuple[pd.DataFrame, dict[str, str]]:
         _refresh_in_background(missing, no_copy)
         with _UPDATES_LOCK:  # no copy and not loading: it failed less than RETRY_SECONDS ago
             errors = {s: _FAILED[s][1] for s in no_copy if s not in _LOADING and s in _FAILED}
-    data = pd.concat(frames, ignore_index=True) if frames else empty_data()
+    data = pd.concat([f[DATA_COLUMNS] for f in frames], ignore_index=True) if frames else empty_data()
+    with _UPDATES_LOCK:
+        _LOADED_GENERATIONS.add(generation)
     return data, errors
 
 
@@ -724,10 +710,14 @@ def source_updates(generation: int = 0) -> dict[str, dt.date | None]:
     """
     {source key: release date or None} for every source in sources.SOURCES: when the publisher last
     released it, not when the app fetched it. None for a source that failed or whose date couldn't be
-    read. Loads the data first (cached, so normally free), which records the dates. Cached like the data
-    (per generation, 24h, until "Refresh data"); called without arguments.
+    read. Loads the data first if this generation hasn't been (that records the dates; checked without
+    load_data()'s copy of the table). Cached like the data (per generation, 24h, until "Refresh data");
+    called without arguments.
     """
-    load_data()
+    with _UPDATES_LOCK:
+        loaded = generation in _LOADED_GENERATIONS
+    if not loaded:
+        load_data()
     on_disk = _read_updates_file()
     with _UPDATES_LOCK:
         return {key: _UPDATES.get(key, on_disk.get(key)) for key in ds.SOURCES}
@@ -761,7 +751,7 @@ def trends_data(data: pd.DataFrame, entity_code: str) -> pd.DataFrame:
     """
     Everything the Trends tab charts for one entity (World, a region, an income group or a country),
     year-indexed: one column per SERIES code (all present, empty where a source has no data for this
-    entity), plus the derived BIRTHS, DEATHS and NATURAL_INCREASE columns.
+    entity), plus the DERIVED series marked for it (BIRTHS, DEATHS, NATURAL_INCREASE).
     """
     sub = data.loc[data["country_code"] == entity_code, ["year", "series_code", "value"]]
     if sub.empty:
@@ -769,12 +759,9 @@ def trends_data(data: pd.DataFrame, entity_code: str) -> pd.DataFrame:
     else:
         wide = sub.pivot_table(index="year", columns="series_code", values="value").sort_index()
         wide = wide.reindex(columns=list(SERIES))
-    pop = wide[POP_TOTAL]
-    # Birth/death rates are projected only every 5 years (2030, 2035, ...), so these three
-    # columns are empty for the projection years in between.
-    wide[BIRTHS] = wide[BIRTH_RATE] * pop / 1000
-    wide[DEATHS] = wide[DEATH_RATE] * pop / 1000
-    wide[NATURAL_INCREASE] = wide[BIRTHS] - wide[DEATHS]
+    for code, (inputs, combine, in_trends) in DERIVED.items():
+        if in_trends:
+            wide[code] = combine(*(wide[i] for i in inputs))
     return wide
 
 
@@ -787,8 +774,9 @@ def projection_starts(data: pd.DataFrame) -> dict[str, float]:
     that is still right after the last observed year, so every projection shows as one.
     """
     flags = data["is_projection"].astype(bool)
-    first_projected = data[flags].groupby("series_code")["year"].min()
-    observed = data.loc[~flags, ["series_code", "year"]]
+    first_projected = data.loc[flags, ["series_code", "year"]].groupby("series_code")["year"].min()
+    # Only the series with projections (a few of the table's ~690k rows' series) are compared
+    observed = data.loc[~flags & data["series_code"].isin(first_projected.index), ["series_code", "year"]]
     observed = observed[observed["year"] < observed["series_code"].map(first_projected)]
     last_observed = observed.groupby("series_code")["year"].max()
     return {code: float(last_observed[code] + 0.5) if code in last_observed.index else float(first - 0.5)
@@ -819,20 +807,23 @@ def series_split(series_code: str, data: pd.DataFrame) -> float:
     return splits.get(DERIVED_FROM.get(series_code, series_code), math.inf)
 
 
+def first_projection_year(series_code: str, data: pd.DataFrame) -> int | None:
+    """The first projected year of a series (series_split undone: its last observed year + 1), or None
+    for a series without projections."""
+    split = series_split(series_code, data)
+    return int(split + 0.5) if split < math.inf else None
+
+
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False, hash_funcs=_DF_HASH_FUNCS)
 def country_indicator_wide(data: pd.DataFrame, countries: pd.DataFrame, series_code: str) -> pd.DataFrame:
     """
     One indicator for every real country: rows = country_code, columns = years (only years
     with any data). Only countries in the World Bank's country list are kept. series_code can also
-    be NATURAL_CHANGE_RATE or NET_MIGRATION_RATE; they only cover years where every input has a value
-    (e.g. birth/death rates are projected only every 5 years, so the natural change rate is too).
+    be a DERIVED one (e.g. NATURAL_CHANGE_RATE); it only covers years where every input has a value.
     """
-    if series_code == NATURAL_CHANGE_RATE:
-        wide = (country_indicator_wide(data, countries, BIRTH_RATE)
-                - country_indicator_wide(data, countries, DEATH_RATE))
-    elif series_code == NET_MIGRATION_RATE:
-        wide = (country_indicator_wide(data, countries, NET_MIGRATION)
-                / country_indicator_wide(data, countries, POP_TOTAL) * 1000)
+    if series_code in DERIVED:
+        inputs, combine, _ = DERIVED[series_code]
+        wide = combine(*(country_indicator_wide(data, countries, code) for code in inputs))
     else:
         codes = real_country_codes(countries)
         sub = data.loc[data["series_code"] == series_code, ["country_code", "year", "value"]]

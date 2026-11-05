@@ -36,7 +36,6 @@ for (code, name), expected in cases.items():
 raw = pd.DataFrame({"c": ["USA", "UVK", "G110", "USA"], "v": [1, 2, 3, 4]})
 out = cd.unify_countries(raw, code_col="c")
 assert list(out["country_code"]) == ["USA", "XKX", "USA"] and list(out["country_name"])[1] == "Kosovo"
-assert all(du.REGION_CODES[c] == cd.COUNTRIES[c] for c in du.REGION_CODES)  # same names as the population data
 print("OK: country dictionary")
 
 # --- 2. One failing source ---

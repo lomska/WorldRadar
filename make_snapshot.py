@@ -27,7 +27,7 @@ def main() -> int:
     keys = list(du.SNAPSHOT_SOURCES)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(keys) + 1) as executor:
         futures = {key: executor.submit(ds.SOURCES[key]["fetch"], du._SESSION) for key in keys}
-        countries_future = executor.submit(du.fetch_countries)
+        countries_future = executor.submit(ds.fetch_countries, du._SESSION)
         results, failed = {}, []
         for key, future in futures.items():
             try:
