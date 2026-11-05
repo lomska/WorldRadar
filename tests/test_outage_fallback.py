@@ -42,19 +42,46 @@ with patch.object(du._SESSION, "get", side_effect=wdi_down_get):
     data, errors = fresh_load()
     assert errors == {}, errors  # not an error: shown from the saved copy
     assert data["series_code"].str.startswith("WB:").sum() == wdi_rows
+    du.wait_for_background_refresh()  # the refetch of the expired copy, which fails
     stale = du.stale_sources()
     assert set(stale) == {"WDI"}, stale
     saved, message = stale["WDI"]
     assert abs(saved.timestamp() - old_time) < 5 and "WDI unreachable" in message, stale
     assert du.source_updates()["WDI"] is not None  # its release date comes from disk too
 
+    # A new process: no memory of the failure, so the page's own load starts the background refetch, and
+    # the note appears from the next run on (the AppTest's second run).
+    du._forget_in_memory()
+    st.cache_data.clear()
     at = AppTest.from_file(_pathfix.APP_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception, at.exception
+    du.wait_for_background_refresh()
+    assert "WDI" in du._FAILED, "the failed background refetch should be recorded"
     at.run()
     assert not at.exception, at.exception
     notes = [i.value for i in at.info if "copy saved earlier" in i.value]
     assert len(notes) == 1 and du.SOURCE_LABELS["WDI"] in notes[0], [i.value for i in at.info]
     assert not any("Couldn't load data from" in w.value for w in at.warning), [w.value for w in at.warning]
 print("OK: a source that is down is shown from its saved copy, with a note naming it")
+
+# --- 1b. A source that just failed isn't retried in the background on every load ---
+retried = []
+
+
+def wdi_down_counting(url, *args, **kwargs):
+    if url.startswith(ds.WDI_URL.split("{")[0]):
+        retried.append(url)
+    return wdi_down_get(url, *args, **kwargs)
+
+
+with patch.object(du._SESSION, "get", side_effect=wdi_down_counting):
+    for _ in range(3):
+        du.load_data.clear()
+        du.load_data()
+        du.wait_for_background_refresh()
+assert retried == [], f"retried within RETRY_SECONDS: {len(retried)} requests"
+print("OK: a source that failed in the background isn't retried before RETRY_SECONDS")
 
 # --- 2. No saved copy: still an error, as before ---
 du.clear_disk_cache()

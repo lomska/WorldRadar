@@ -124,6 +124,10 @@ stale_time = time.time() - 3 * du.CACHE_TTL_SECONDS
 os.utime(du._COUNTRIES_CACHE_FILE, (stale_time, stale_time))
 st.cache_data.clear()
 with patch.object(du._SESSION, "get", side_effect=countries_down_get):
+    countries, errors = du.load_countries()  # shown at once, refetched in the background
+    assert errors == {}, errors
+    pd.testing.assert_frame_equal(countries.reset_index(drop=True), good_countries.reset_index(drop=True))
+    du.wait_for_background_refresh()  # it fails: from the next run on, the saved copy comes with the error
     countries, errors = du.load_countries()
     assert set(errors) == {du.COUNTRIES_SOURCE}, errors
     pd.testing.assert_frame_equal(countries.reset_index(drop=True), good_countries.reset_index(drop=True))

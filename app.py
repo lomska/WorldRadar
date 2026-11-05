@@ -389,6 +389,32 @@ def stale_sources_notice():
         st.code("\n".join(f"{key}: {message}" for key, (_, message) in stale.items()))
 
 
+LOADING_POLL_SECONDS = 3
+
+
+def loading_notice(generation: int):
+    """While sources with nothing to show yet are downloading in the background (du.loading_sources), a note
+    naming them, checked every LOADING_POLL_SECONDS; once they are in, or if a background refresh has
+    already brought newer data than this run's (generation: du.data_generation() before load_data), the
+    page reruns to show them. Never raises."""
+    try:
+        if du.loading_sources() or du.data_generation() != generation:
+            _loading_watch(generation)
+    except Exception:  # noqa: BLE001 -- only the note (and the automatic rerun) is lost
+        pass
+
+
+@st.fragment(run_every=LOADING_POLL_SECONDS)
+def _loading_watch(generation: int):
+    loading = du.loading_sources()
+    if not loading:
+        if du.data_generation() != generation:
+            st.rerun()  # the whole page, with the new data
+        return
+    names = "; ".join(source_name(s) for s in sorted(loading, key=source_name))
+    st.info(f"Still downloading: {names}. Their charts will appear here in a few seconds.")
+
+
 def stop_if_nothing_loaded(errors: dict[str, str], data: pd.DataFrame):
     """Stop the app, with an error, only when nothing can be shown: every source failed or returned no data."""
     if not data.empty:
@@ -2011,6 +2037,9 @@ def tab_distributions(data: pd.DataFrame, countries: pd.DataFrame, errors: dict[
     source = du.SOURCE_LABELS[source_key]
     wide = du.country_indicator_wide(data, countries, spec["series"])
     years = [int(y) for y in wide.columns]
+    if not years and source_key in du.loading_sources():
+        st.info(f"“{label}” is still downloading from {source}. It will appear here in a few seconds.")
+        return
     if not years:
         failed = source_key in errors
         st.info(f"No country data loaded for “{label}”"
@@ -2226,11 +2255,13 @@ def main():
             st.cache_data.clear()
             st.rerun()
 
+    generation = du.data_generation()  # before load_data: a background refresh that ends later changes it
     data, data_errors = load_data()
     errors = {**data_errors, **country_errors}
     stop_if_nothing_loaded(errors, data)
     countries_warning(errors, countries)
     stale_sources_notice()
+    loading_notice(generation)
 
     # Distributions first, so the app opens on it. Each tab is an st.fragment:
     # a full run (page load, "Refresh data") still builds both, since st.tabs isn't lazy.

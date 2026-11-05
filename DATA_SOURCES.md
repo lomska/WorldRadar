@@ -4,7 +4,8 @@ The app's code is under the PolyForm Noncommercial License 1.0.0 (see [LICENSE](
 shows is not: it belongs to the publishers below and is used under their terms. Each publisher's terms
 were checked against its own pages on 11 October 2026. This is a summary, not legal advice.
 
-**Changes made by the app.** The app downloads each source at run time and charts the published values.
+**Changes made by the app.** The app downloads each source at run time (a snapshot of some is in the
+repository: "Copies of the data", below) and charts the published values.
 It reshapes them (one long table, country names and codes unified through `country_dict.py`) and draws
 yearly statistics across countries (histograms, quartiles, box plots, maps). It derives one series:
 natural population growth (birth rate minus death rate), from the World Bank population data. Projected
@@ -168,11 +169,30 @@ World Happiness Report, SWIID) are used on that basis, with the credits above. I
 commercially (advertising, fees, paid client work), these terms must be checked again and permission
 sought where needed.
 
-## Not redistributed
+## Copies of the data
 
-The app downloads the IMF, ND-GAIN, World Happiness Report, Harvard Growth Lab, SWIID and EDGAR data at run
-time, from the publishers' own servers, and caches it locally (`.wb_data_cache/`, not committed). The
-repository holds no copy of that data.
+The app downloads every source at run time, from the publishers' own servers, and caches it locally
+(`.wb_data_cache/`, not committed).
+
+**Snapshot in the repository.** `data_snapshot/` holds a copy of the sources whose terms allow
+redistribution with credit, written by `make_snapshot.py` (snapshot date in `data_snapshot/snapshot.json`).
+The app shows it right after a restart while it downloads the current data. It holds, unaltered, as
+published (only stored in another file format):
+
+- World Bank population estimates and projections, World Development Indicators (with the EDGAR series)
+  and PIP, ILOSTAT, UNDP and Harvard Growth Lab: CC BY 4.0, CC BY 3.0 IGO and CC0 1.0, all of which allow
+  redistribution with credit;
+- the IMF World Economic Outlook series: the IMF's terms allow users to copy, publish and distribute the
+  data with the credit above; commercial reuse needs permission;
+- the IEA-derived part of the EDGAR emissions: CC BY-NC-ND 4.0, which allows non-commercial sharing with
+  credit (a change of file format or a selection of the data is not an adaptation);
+- the World Bank country list.
+
+The IMF and EDGAR parts are redistributed on the non-commercial basis above.
+
+**Not redistributed.** ND-GAIN, the World Happiness Report and SWIID name no licence, so there is no
+permission to republish their data: the repository holds no copy of it. After a restart, their charts
+fill in once the download is done.
 
 ## Country flags
 

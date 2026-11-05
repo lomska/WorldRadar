@@ -110,7 +110,9 @@ with patch.object(du._SESSION, "get", side_effect=counting_get):
     stale = pd.read_parquet(ndgain_file)
     stale[stale["series_code"] == "NDGAIN:GAIN"].to_parquet(ndgain_file, index=False)
     du.load_data.clear()
-    data3, _ = du.load_data()
+    du.load_data()  # shown as it is meanwhile, refetched in the background
+    du.wait_for_background_refresh()
+    data3, _ = du.load_data()  # the next run: the refetched copy
     assert calls[n_first:] == [ds.NDGAIN_URL], calls[n_first:]  # only the stale source
     assert set(ds.series_of("NDGAIN")) <= set(data3["series_code"])
 du.clear_disk_cache()
@@ -160,8 +162,8 @@ with patch.object(du._SESSION, "get", side_effect=counting_get):
     du.load_data.clear()
     n_before = len(calls)
     du.load_data()
+    du.wait_for_background_refresh()
     assert calls[n_before:] == [ds.WHR_URL], calls[n_before:]  # only that source is refetched
-    du.source_updates.clear()
     assert du.source_updates()["WHR"] == ds.WHR_RELEASED
     assert "WHR" in json.loads(du._UPDATES_CACHE_FILE.read_text(encoding="utf-8"))  # healed on disk too
 du.clear_disk_cache()

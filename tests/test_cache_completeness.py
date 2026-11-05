@@ -54,7 +54,9 @@ with patch.object(du._SESSION, "get", side_effect=counting_fake_get):
     # sitting there with a fresh mtime -- exactly the reported bug's starting condition.
     du.load_data.clear()
     n_before = len(calls)
-    data2, _ = du.load_data()
+    du.load_data()  # shown as it is meanwhile, refetched in the background
+    du.wait_for_background_refresh()
+    data2, _ = du.load_data()  # the next run: the refetched copy
 
     refetched = calls[n_before:]
     assert refetched and all(map(is_population_call, refetched)), (
@@ -75,6 +77,7 @@ with patch.object(du._SESSION, "get", side_effect=counting_fake_get):
     du.load_data.clear()
     n_before = len(calls)
     du.load_data()
+    du.wait_for_background_refresh()
     assert calls[n_before:] and all(map(is_population_call, calls[n_before:])), "a cache without its release date was trusted"
     assert ds.POPULATION in json.loads(du._UPDATES_CACHE_FILE.read_text(encoding="utf-8"))
     n_before = len(calls)

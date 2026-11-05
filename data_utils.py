@@ -16,10 +16,12 @@ Two layers of caching sit in front of the network:
 Both layers share the same TTL, and both are best-effort: if the filesystem
 turns out to be read-only or ephemeral on a given host, the disk layer just
 quietly never hits, and the app fetches over the network (in parallel) every
-time the in-memory cache is cold. The TTL only decides when to try the network again: when a
-source can't be fetched, its file is used whatever its age (load_data, stale_sources), so an
-outage shows the last saved data instead of empty charts. "Refresh data" therefore expires the
-files (expire_disk_cache) rather than deleting them.
+time the in-memory cache is cold. The TTL only decides when to try the network again: a source
+that isn't fresh on disk is shown from its saved copy (the file whatever its age, or the snapshot
+committed in data_snapshot/) while it is fetched in the background, and when it can't be fetched,
+that copy stays (stale_sources), so an outage shows the last saved data instead of empty charts.
+See "Background refresh" below. "Refresh data" therefore expires the files (expire_disk_cache)
+rather than deleting them, and is the one case (with nothing at all to show) where the page waits.
 
 A third, separate kind of caching applies to the pandas transform functions
 below (trends_data, country_indicator_wide, projection_starts): st.tabs isn't lazy, so a full
@@ -73,6 +75,15 @@ _UPDATES_CACHE_FILE = _CACHE_DIR / "source_updates.json"  # release dates, see s
 # Written by expire_disk_cache() ("Refresh data"): every cache file older than its own mtime counts as
 # expired, though it is still there as the fallback for a source that can't be fetched.
 _EXPIRED_MARKER = _CACHE_DIR / "expired_before"
+# The snapshot committed with the app (make_snapshot.py writes it): a copy of the openly licensed sources
+# and the country list, shown when a new process has no disk cache (a redeploy, a host waking a sleeping
+# app) while the sources are fetched in the background. Never written at run time. WB_DATA_SNAPSHOT_DIR
+# overrides its location (the tests point it at an empty dir).
+_SNAPSHOT_DIR = Path(os.environ.get("WB_DATA_SNAPSHOT_DIR") or Path(__file__).resolve().parent / "data_snapshot")
+_SNAPSHOT_MANIFEST = _SNAPSHOT_DIR / "snapshot.json"  # {"saved": {key: ISO datetime}, "updates": {key: date}}
+# Sources whose terms allow a copy in the repository (DATA_SOURCES.md). ND-GAIN, the World Happiness Report
+# and SWIID name no licence, so they are not redistributed: after a restart they load in the background.
+SNAPSHOT_SOURCES = ("POP", "WDI", "PIP", "IMF", "ILO", "UNDP", "ECI")
 
 # Every series the app can chart (code -> name) and every source (key -> label), from sources.py.
 SERIES: dict[str, str] = ds.SERIES
@@ -220,10 +231,11 @@ def _write_parquet_atomic(f: Path, df: pd.DataFrame) -> None:
 
 
 def _forget_in_memory() -> None:
-    """Drop the release dates and stale-source notes kept in memory (both cache resets)."""
+    """Drop the release dates, stale-source notes and failed fetches kept in memory (both cache resets)."""
     with _UPDATES_LOCK:
         _UPDATES.clear()
         _STALE.clear()
+        _FAILED.clear()
 
 
 def clear_disk_cache() -> None:
@@ -251,6 +263,8 @@ def expire_disk_cache() -> None:
     except Exception:  # noqa: BLE001 -- a read-only filesystem: nothing on disk to expire
         pass
     _forget_in_memory()
+    with _UPDATES_LOCK:  # the person who clicked waits for the new data (no background refresh)
+        _WAIT_NEXT_LOAD.update({DATA_KEY, COUNTRIES_SOURCE})
 
 
 # --------------------------------------------------------------------------
@@ -265,8 +279,121 @@ def expire_disk_cache() -> None:
 _UPDATES: dict[str, dt.date | None] = {}
 _UPDATES_LOCK = threading.Lock()  # the sources are loaded on several threads (also guards _STALE)
 # Sources that couldn't be fetched and are shown from an older disk cache instead: {source key: (when that
-# copy was saved, the fetch error)}. Filled by load_data(); read through stale_sources().
+# copy was saved, the fetch error)}. Filled by load_data() and the background refresh; read through
+# stale_sources(). An entry stays until that source is fetched again (or a cache reset).
 _STALE: dict[str, tuple[dt.datetime, str]] = {}
+# The last failed fetch of each source (and COUNTRIES_SOURCE): {key: (time.time(), error message)}; cleared on
+# a successful fetch. A source served from its saved copy isn't retried in the background for RETRY_SECONDS.
+_FAILED: dict[str, tuple[float, str]] = {}
+RETRY_SECONDS = 60 * 60
+
+
+# --------------------------------------------------------------------------
+# Background refresh
+# --------------------------------------------------------------------------
+# No visitor waits for a download while there is something to show. When the in-memory cache runs out, a
+# source past the TTL is shown from its saved copy (_read_saved_copy: the disk cache whatever its age, or the
+# snapshot shipped with the app) and fetched again on a background thread; a source with no copy at all is
+# fetched in the background too, and is "loading" (loading_sources()) until it arrives. When a thread is
+# done it bumps its loader's generation (_GENERATION): load_data(), source_updates() and load_countries()
+# are cached per generation, so the next call recomputes from the new files on disk. (Clearing their
+# caches instead would race: a fetch that ends before the call that started it has stored its result
+# would leave the old result cached for a day.) The page waits for the network only when no source has
+# any copy at all, and after "Refresh data" (expire_disk_cache puts both loaders in _WAIT_NEXT_LOAD).
+
+DATA_KEY = "DATA"  # load_data()'s key in _WAIT_NEXT_LOAD and _GENERATION (COUNTRIES_SOURCE is load_countries()')
+_WAIT_NEXT_LOAD: set[str] = set()
+_GENERATION: dict[str, int] = {DATA_KEY: 0, COUNTRIES_SOURCE: 0}
+_REFRESHING: set[str] = set()  # the keys being fetched in the background now
+_LOADING: set[str] = set()  # those of them with no copy to show meanwhile
+_REFRESH_THREADS: list[threading.Thread] = []
+
+
+def _take_wait_request(key: str) -> bool:
+    """Whether "Refresh data" asked this loader to wait for the network (once)."""
+    with _UPDATES_LOCK:
+        if key in _WAIT_NEXT_LOAD:
+            _WAIT_NEXT_LOAD.discard(key)
+            return True
+        return False
+
+
+def _per_generation(key: str):
+    """Decorator for an st.cache_data function taking one `generation` argument: called with none, it gets
+    _GENERATION[key], so a background refresh's bump makes the next call recompute. .clear() clears it."""
+    def decorate(cached):
+        def call():
+            with _UPDATES_LOCK:
+                generation = _GENERATION[key]
+            return cached(generation)
+        call.__doc__, call.__name__, call.clear = cached.__doc__, key.lower(), cached.clear
+        return call
+    return decorate
+
+
+def data_generation() -> int:
+    """load_data()'s current generation: it changes when a background refresh has new data on disk."""
+    with _UPDATES_LOCK:
+        return _GENERATION[DATA_KEY]
+
+
+def loading_sources() -> set[str]:
+    """The sources with nothing to show yet, being fetched in the background."""
+    with _UPDATES_LOCK:
+        return set(_LOADING)
+
+
+def _refresh_in_background(keys: list[str], no_copy: list[str] = ()) -> None:
+    """Fetch these sources (and/or COUNTRIES_SOURCE) on a background thread, skipping any already being
+    fetched or that failed less than RETRY_SECONDS ago. no_copy: those with nothing to show meanwhile."""
+    with _UPDATES_LOCK:
+        now = time.time()
+        todo = [k for k in keys if k not in _REFRESHING and now - _FAILED.get(k, (-math.inf, ""))[0] > RETRY_SECONDS]
+        _REFRESHING.update(todo)
+        _LOADING.update(k for k in todo if k in no_copy)
+        _REFRESH_THREADS[:] = [t for t in _REFRESH_THREADS if t.is_alive()]
+        if not todo:
+            return
+        thread = threading.Thread(target=_background_refresh, args=(todo,), name="data-refresh", daemon=True)
+        _REFRESH_THREADS.append(thread)
+    thread.start()
+
+
+def _background_refresh(keys: list[str]) -> None:
+    """The background thread: fetch and write to disk (_fetch_sources, _fetch_countries_to_disk), then bump
+    the generations so the next run reads the result. A source that fails keeps its saved copy, noted by
+    stale_sources() (with none, it is an error from the next run on); a failed country list keeps its
+    copy, with the error."""
+    sources = [k for k in keys if k in ds.SOURCES]
+    try:
+        _, failed = _fetch_sources(sources)
+        for source, message in failed.items():
+            copy = _read_saved_copy(source)
+            if copy is not None:
+                with _UPDATES_LOCK:
+                    _STALE[source] = (copy[1], message)
+        if COUNTRIES_SOURCE in keys:
+            try:
+                _fetch_countries_to_disk()
+            except Exception:  # noqa: BLE001 -- recorded in _FAILED; load_countries reports it
+                pass
+    finally:
+        with _UPDATES_LOCK:  # bump before leaving _LOADING: a source is always either loading or newer
+            if sources:
+                _GENERATION[DATA_KEY] += 1
+            if COUNTRIES_SOURCE in keys:
+                _GENERATION[COUNTRIES_SOURCE] += 1
+            _LOADING.difference_update(keys)
+            _REFRESHING.difference_update(keys)
+
+
+def wait_for_background_refresh(timeout: float = 120) -> None:
+    """Wait for the background refreshes started so far (the tests use it)."""
+    deadline = time.time() + timeout
+    with _UPDATES_LOCK:
+        threads = list(_REFRESH_THREADS)
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.time()))
 
 
 def _read_updates_file() -> dict[str, dt.date | None]:
@@ -351,20 +478,48 @@ def _clean_countries(countries: pd.DataFrame) -> pd.DataFrame:
     })
 
 
-def _read_countries_cache(fresh_only: bool = True) -> pd.DataFrame | None:
-    """The on-disk country list: only if still fresh (fresh_only), or whatever its age (the fallback when
-    the endpoint is down). None if missing, unreadable, or written before a column was added (iso2_code,
-    for the flags): such a file is a miss, so it self-heals on the next load."""
-    if fresh_only:
-        countries = _read_parquet_if_fresh(_COUNTRIES_CACHE_FILE)
-    else:
-        try:
-            countries = pd.read_parquet(_COUNTRIES_CACHE_FILE)
-        except Exception:  # noqa: BLE001 -- missing or corrupt
-            return None
-    if countries is None or countries.empty or not set(COUNTRIES_COLUMNS) <= set(countries.columns):
+def _snapshot_copy(key: str, file_name: str) -> tuple[pd.DataFrame, dt.datetime] | None:
+    """The snapshot's copy of a source (or COUNTRIES_SOURCE), with when it was saved; None if it has none."""
+    try:
+        saved = json.loads(_SNAPSHOT_MANIFEST.read_text(encoding="utf-8"))["saved"][key]
+        return pd.read_parquet(_SNAPSHOT_DIR / file_name), dt.datetime.fromisoformat(saved)
+    except Exception:  # noqa: BLE001 -- no snapshot, or none of this source
         return None
-    return _clean_countries(countries)  # files written before the strip was added
+
+
+def _snapshot_update(key: str) -> tuple[bool, dt.date | None]:
+    """(whether the snapshot records a release date for this source, the date)."""
+    try:
+        updates = json.loads(_SNAPSHOT_MANIFEST.read_text(encoding="utf-8"))["updates"]
+        return key in updates, dt.date.fromisoformat(updates[key]) if updates.get(key) else None
+    except Exception:  # noqa: BLE001
+        return False, None
+
+
+def _read_countries_cache(fresh_only: bool = True) -> pd.DataFrame | None:
+    """The on-disk country list: only if still fresh (fresh_only), or else the newer of the disk cache
+    (whatever its age) and the snapshot's. None if missing, unreadable, or written before a column was
+    added (iso2_code, for the flags): such a file is a miss, so it self-heals on the next load."""
+    def valid(countries):
+        if countries is None or countries.empty or not set(COUNTRIES_COLUMNS) <= set(countries.columns):
+            return None
+        return _clean_countries(countries)  # files written before the strip was added
+
+    if fresh_only:
+        return valid(_read_parquet_if_fresh(_COUNTRIES_CACHE_FILE))
+    copies = []
+    try:
+        copies.append((pd.read_parquet(_COUNTRIES_CACHE_FILE),
+                       dt.datetime.fromtimestamp(_COUNTRIES_CACHE_FILE.stat().st_mtime)))
+    except Exception:  # noqa: BLE001 -- missing or corrupt
+        pass
+    snapshot = _snapshot_copy(COUNTRIES_SOURCE, _COUNTRIES_CACHE_FILE.name)
+    if snapshot is not None:
+        copies.append(snapshot)
+    for countries, _ in sorted(copies, key=lambda c: c[1], reverse=True):
+        if valid(countries) is not None:
+            return valid(countries)
+    return None
 
 
 def countries_from_dict() -> pd.DataFrame:
@@ -378,7 +533,8 @@ def countries_from_dict() -> pd.DataFrame:
 
 
 def fallback_countries() -> pd.DataFrame:
-    """The country list when fetch_countries() fails: the disk cache even if stale, else country_dict's."""
+    """The country list when fetch_countries() fails: the disk cache even if stale (or the snapshot's), else
+    country_dict's."""
     stale = _read_countries_cache(fresh_only=False)
     return stale if stale is not None else countries_from_dict()
 
@@ -388,23 +544,45 @@ def has_country_groups(countries: pd.DataFrame) -> bool:
     return bool(countries["region"].notna().any())
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def load_countries() -> tuple[pd.DataFrame, dict[str, str]]:
+@_per_generation(COUNTRIES_SOURCE)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False, max_entries=1)
+def load_countries(generation: int = 0) -> tuple[pd.DataFrame, dict[str, str]]:
     """
-    (countries, errors); never raises. The on-disk copy if fresh, else the /country endpoint (written to
-    disk). If the endpoint fails: errors[COUNTRIES_SOURCE] and fallback_countries(). A failure is cached in
+    (countries, errors); never raises; called without arguments (see _per_generation). The on-disk copy if
+    fresh. Else a saved copy (the disk cache whatever its age, or the snapshot's) is returned as it is and
+    refetched in the background (unless "Refresh data" asked to wait); with no copy, the /country endpoint
+    (written to disk). If the endpoint fails: errors[COUNTRIES_SOURCE] and fallback_countries() (a failed
+    background refetch: the saved copy, with the error, from the next run on). A failure is cached in
     memory like a success (24h, until "Refresh data"), so an unreachable API isn't retried on every
     widget interaction.
     """
     cached = _read_countries_cache()
     if cached is not None:
         return cached, {}
+    saved = None if _take_wait_request(COUNTRIES_SOURCE) else _read_countries_cache(fresh_only=False)
+    if saved is not None:
+        with _UPDATES_LOCK:  # an earlier failure, read before this refresh can record its own
+            failure = _FAILED.get(COUNTRIES_SOURCE)
+        _refresh_in_background([COUNTRIES_SOURCE])
+        return saved, ({COUNTRIES_SOURCE: failure[1]} if failure else {})
     try:
-        countries = fetch_countries()
+        return _fetch_countries_to_disk(), {}
     except Exception as exc:  # noqa: BLE001 -- reported in the app
         return fallback_countries(), {COUNTRIES_SOURCE: f"{type(exc).__name__}: {exc}"}
+
+
+def _fetch_countries_to_disk() -> pd.DataFrame:
+    """fetch_countries(), written to disk; a failure is recorded in _FAILED and raised."""
+    try:
+        countries = fetch_countries()
+    except Exception as exc:
+        with _UPDATES_LOCK:
+            _FAILED[COUNTRIES_SOURCE] = (time.time(), f"{type(exc).__name__}: {exc}")
+        raise
     _write_parquet_atomic(_COUNTRIES_CACHE_FILE, countries)
-    return countries, {}
+    with _UPDATES_LOCK:
+        _FAILED.pop(COUNTRIES_SOURCE, None)
+    return countries
 
 
 # --------------------------------------------------------------------------
@@ -422,7 +600,7 @@ def _read_source_cache(source: str) -> pd.DataFrame | None:
     directory survives the redeploy on the host's filesystem: without it, an old cache missing the new
     series would be trusted as complete, silently leaving that chart empty until the 24h TTL happened to
     expire or someone clicked "Refresh data". Now a cache like that is a miss, so a redeploy self-heals
-    on its very next load."""
+    on its very next load (it is shown meanwhile, and refetched in the background)."""
     table = _read_parquet_if_fresh(_source_cache_file(source))
     if table is None or not set(ds.series_of(source)) <= set(table["series_code"].unique()):
         return None
@@ -431,19 +609,31 @@ def _read_source_cache(source: str) -> pd.DataFrame | None:
     return table
 
 
-def _read_stale_source(source: str) -> tuple[pd.DataFrame, dt.datetime] | None:
-    """A source's disk cache whatever its age (the fallback when it can't be fetched), with when it was
-    saved; None if missing or unreadable. Its release date, if on disk, goes in memory for source_updates()."""
+def _read_saved_copy(source: str) -> tuple[pd.DataFrame, dt.datetime] | None:
+    """A copy of a source to show when it isn't fresh on disk: the newer of its disk cache (whatever its age)
+    and the snapshot's, with when it was saved; None if neither is readable. Its release date, if recorded,
+    goes in memory for source_updates()."""
+    copies = []
     f = _source_cache_file(source)
     try:
-        table = pd.read_parquet(f)
-        saved = dt.datetime.fromtimestamp(f.stat().st_mtime)
-    except Exception:  # noqa: BLE001 -- missing or corrupt: no fallback
-        return None
-    if table.empty or not set(ds.SCHEMA) <= set(table.columns):
-        return None
-    _cached_update(source)
-    return table, saved
+        copies.append((pd.read_parquet(f), dt.datetime.fromtimestamp(f.stat().st_mtime), "disk"))
+    except Exception:  # noqa: BLE001 -- missing or corrupt
+        pass
+    snapshot = _snapshot_copy(source, f.name)
+    if snapshot is not None:
+        copies.append((*snapshot, "snapshot"))
+    for table, saved, where in sorted(copies, key=lambda c: c[1], reverse=True):
+        if table.empty or not set(ds.SCHEMA) <= set(table.columns):
+            continue
+        if where == "disk":
+            _cached_update(source)
+        else:
+            known, updated = _snapshot_update(source)
+            if known:
+                with _UPDATES_LOCK:
+                    _UPDATES[source] = updated
+        return table, saved
+    return None
 
 
 def empty_data() -> pd.DataFrame:
@@ -451,56 +641,91 @@ def empty_data() -> pd.DataFrame:
     return pd.DataFrame(columns=ds.SCHEMA)
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def load_data() -> tuple[pd.DataFrame, dict[str, str]]:
+@_per_generation(DATA_KEY)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False, max_entries=1)
+def load_data(generation: int = 0) -> tuple[pd.DataFrame, dict[str, str]]:
     """
     Every source as one long table (sources.SCHEMA), plus {source key: error message} for the sources
-    that failed; never raises. A failure doesn't stop the app: the sources are separate publishers (some
-    block scripted downloads from time to time). A source that can't be fetched is shown from its disk
-    cache whatever the age (listed by stale_sources(), not in errors); only one with no cache at all is
-    an error, leaving its own charts empty, with a warning. Each source is cached on disk separately, so
-    only failed or stale sources are refetched, concurrently (I/O-bound requests, so threads help despite
-    the GIL). A failure is cached in memory like a success (24h, until "Refresh data"), so a publisher
-    that is down isn't retried on every widget interaction; it is never written to disk.
+    that failed; never raises; called without arguments (see _per_generation). A failure doesn't stop the
+    app: the sources are separate publishers (some block scripted downloads from time to time). Each
+    source is cached on disk separately; one that isn't fresh there is shown from its saved copy
+    (_read_saved_copy) and fetched in the background, and one with no copy at all is fetched in the
+    background too, its charts empty meanwhile (loading_sources()). See "Background refresh". The page waits
+    for the network instead when no source has any copy, and after "Refresh data": the sources are fetched
+    concurrently (I/O-bound requests, so threads help despite the GIL), and one that fails is shown from its
+    copy (listed by stale_sources(), not in errors). Only a source that failed with no copy at all is an
+    error, leaving its own charts empty, with a warning. A failure is cached in memory like a success (24h,
+    until "Refresh data"; RETRY_SECONDS for a retry in the background), so a publisher that is down isn't
+    retried on every widget interaction; it is never written to disk.
     """
-    with _UPDATES_LOCK:
-        _STALE.clear()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ds.SOURCES)) as executor:
-        cached = dict(zip(ds.SOURCES, executor.map(_read_source_cache, ds.SOURCES)))  # parquet reads release the GIL
-    frames = [table for table in cached.values() if table is not None]
-    missing = [source for source, table in cached.items() if table is None]
+    def read_all(read, sources):
+        if not sources:
+            return {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(sources)) as executor:  # parquet reads release the GIL
+            return dict(zip(sources, executor.map(read, sources)))
+
+    fresh = read_all(_read_source_cache, list(ds.SOURCES))
+    frames = [table for table in fresh.values() if table is not None]
+    missing = [source for source, table in fresh.items() if table is None]
+    wait = _take_wait_request(DATA_KEY)
+    copies = {} if wait else {s: c for s, c in read_all(_read_saved_copy, missing).items() if c is not None}
+    if len(missing) == len(ds.SOURCES) and not copies:
+        wait = True  # nothing at all to show: the page waits
     errors = {}
-    if missing:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(missing)) as executor:
-            futures = {s: executor.submit(ds.SOURCES[s]["fetch"], _SESSION) for s in missing}
-            for source, future in futures.items():
-                try:
-                    table, updated = future.result()
-                except Exception as exc:  # noqa: BLE001 -- reported in the app, per source
-                    message = f"{type(exc).__name__}: {exc}"
-                    stale = _read_stale_source(source)
-                    if stale is None:
-                        errors[source] = message
-                        continue
-                    table, saved = stale
-                    frames.append(table)
-                    with _UPDATES_LOCK:
-                        _STALE[source] = (saved, message)
-                else:
-                    frames.append(table)
-                    _write_parquet_atomic(_source_cache_file(source), table)
-                    _record_update(source, updated)
+    if wait:
+        tables, failed = _fetch_sources(missing)
+        frames += tables.values()
+        for source, message in failed.items():
+            copy = _read_saved_copy(source)
+            if copy is None:
+                errors[source] = message
+                continue
+            frames.append(copy[0])
+            with _UPDATES_LOCK:
+                _STALE[source] = (copy[1], message)
+    else:
+        frames += [copies[source][0] for source in missing if source in copies]
+        no_copy = [source for source in missing if source not in copies]
+        _refresh_in_background(missing, no_copy)
+        with _UPDATES_LOCK:  # no copy and not loading: it failed less than RETRY_SECONDS ago
+            errors = {s: _FAILED[s][1] for s in no_copy if s not in _LOADING and s in _FAILED}
     data = pd.concat(frames, ignore_index=True) if frames else empty_data()
     return data, errors
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def source_updates() -> dict[str, dt.date | None]:
+def _fetch_sources(sources: list[str]) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    """Fetch these sources concurrently: ({source: table} for the successes, each written to disk with its
+    release date; {source: error message} for the failures, recorded in _FAILED)."""
+    tables, failed = {}, {}
+    if not sources:
+        return tables, failed
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(sources)) as executor:
+        futures = {s: executor.submit(ds.SOURCES[s]["fetch"], _SESSION) for s in sources}
+        for source, future in futures.items():
+            try:
+                table, updated = future.result()
+            except Exception as exc:  # noqa: BLE001 -- reported in the app, per source
+                failed[source] = f"{type(exc).__name__}: {exc}"
+                with _UPDATES_LOCK:
+                    _FAILED[source] = (time.time(), failed[source])
+                continue
+            tables[source] = table
+            _write_parquet_atomic(_source_cache_file(source), table)
+            _record_update(source, updated)
+            with _UPDATES_LOCK:
+                _FAILED.pop(source, None)
+                _STALE.pop(source, None)
+    return tables, failed
+
+
+@_per_generation(DATA_KEY)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False, max_entries=1)
+def source_updates(generation: int = 0) -> dict[str, dt.date | None]:
     """
     {source key: release date or None} for every source in sources.SOURCES: when the publisher last
     released it, not when the app fetched it. None for a source that failed or whose date couldn't be
     read. Loads the data first (cached, so normally free), which records the dates. Cached like the data
-    (24h, until "Refresh data").
+    (per generation, 24h, until "Refresh data"); called without arguments.
     """
     load_data()
     on_disk = _read_updates_file()
@@ -508,14 +733,12 @@ def source_updates() -> dict[str, dt.date | None]:
         return {key: _UPDATES.get(key, on_disk.get(key)) for key in ds.SOURCES}
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def stale_sources() -> dict[str, tuple[dt.datetime, str]]:
     """
     {source key: (when its shown copy was saved, the fetch error)} for the sources that couldn't be fetched
-    and are shown from an older disk cache. Loads the data first (cached, so normally free), which fills
-    it. Cached like the data (24h, until "Refresh data").
+    and are shown from a saved copy, as load_data() and the background refresh found them (call it after
+    load_data()). Not cached: a background refresh that fails adds to it while the data stays cached.
     """
-    load_data()
     with _UPDATES_LOCK:
         return dict(_STALE)
 

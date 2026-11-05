@@ -20,6 +20,9 @@ _PROJECT_ROOT = _HERE.parent
 # flat lines, 100% bars -- for up to 24h. Must run before data_utils is imported, since
 # it reads this once at import time; every test imports this module first.
 os.environ["WB_DATA_CACHE_DIR"] = str(Path(tempfile.gettempdir()) / "wb_population_test_cache")
+# Likewise the committed data snapshot (data_snapshot/): the tests start with none, so a load with nothing on
+# disk fetches every source as before; a test that wants one writes it here (test_background_refresh.py).
+os.environ["WB_DATA_SNAPSHOT_DIR"] = str(Path(tempfile.gettempdir()) / "wb_population_test_snapshot")
 
 for _p in (_PROJECT_ROOT, _HERE):
     _p_str = str(_p)
